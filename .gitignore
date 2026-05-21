@@ -1,0 +1,57 @@
+# 環境変数（絶対にコミット禁止）
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# データファイル（個人情報・APIコスト浪費の温床）
+data/*.csv
+data/raw/
+data/cache/
+!data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite3
+postgres_data/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
+
+# Claude Code関連
+.claude/CLAUDE.local.md
+.claude/cache/
+
+# Windows 予約デバイス名（誤生成ファイル）
+nul
+
+# 一時ファイル・ログ
+ログ.txt
+data/*.txt

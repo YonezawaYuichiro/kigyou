@@ -1,0 +1,39 @@
+{
+  "required_skills": [
+    "Python",
+    "機械学習",
+    "AWS"
+  ],
+  "bonus_skills": [
+    "ROS2",
+    "OpenCV",
+    "PyTorch",
+    "MLOps",
+    "Edge AI",
+    "CUDA",
+    "C++"
+  ],
+  "target_roles": [
+    "バックエンドエンジニア",
+    "MLエンジニア"
+  ],
+  "preferred_prefectures": [
+    "大阪府",
+    "京都府"
+  ],
+  "weights": {
+    "tech_growth": 0.2877,
+    "wlb": 0.2877,
+    "company_size": 0.0913,
+    "self_developed": 0.2877,
+    "location": 0.0456
+  },
+  "hard_filters": {
+    "max_overtime_hours": 30,
+    "min_openwork_score": 2.0,
+    "remote_work": [
+      "full",
+      "partial"
+    ]
+  }
+}
