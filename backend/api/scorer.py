@@ -106,7 +106,13 @@ def calc_score(
     stack = set(company.tech_stack or [])
     required_score = len(stack & required) / max(len(required), 1)
     bonus_score = len(stack & bonus) / max(len(bonus), 1) if bonus else 0.0
-    tech_score = required_score * 0.7 + bonus_score * 0.3
+    tech_stack_score = required_score * 0.7 + bonus_score * 0.3
+    # OpenWork「20代成長環境」スコアをブレンド（データあり時）
+    ow_growth = getattr(metrics, "ow_score_growth", None) if metrics else None
+    if ow_growth is not None:
+        tech_score = tech_stack_score * 0.5 + (ow_growth / 5.0) * 0.5
+    else:
+        tech_score = tech_stack_score
 
     # --- WLB ---
     if metrics is not None and metrics.avg_overtime_hours is not None:
@@ -117,15 +123,33 @@ def calc_score(
         leave_score = float(metrics.paid_leave_rate)
     else:
         leave_score = 0.5
-    wlb_score = (overtime_score + leave_score) / 2.0
+    # リモート方針ボーナス（+0.15 / +0.08）
+    remote = getattr(metrics, "remote_work_policy", None) if metrics else None
+    remote_bonus = 0.15 if remote == "full" else (0.08 if remote == "partial" else 0.0)
+    # 社員士気・風通し（OW サブスコア）をブレンド
+    ow_morale = getattr(metrics, "ow_score_morale", None) if metrics else None
+    ow_openness = getattr(metrics, "ow_score_openness", None) if metrics else None
+    ow_culture_list = [s for s in [ow_morale, ow_openness] if s is not None]
+    culture_score = sum(ow_culture_list) / len(ow_culture_list) / 5.0 if ow_culture_list else None
+    if culture_score is not None:
+        base_wlb = overtime_score * 0.4 + leave_score * 0.3 + culture_score * 0.3
+    else:
+        base_wlb = (overtime_score + leave_score) / 2.0
+    wlb_score = min(1.0, base_wlb + remote_bonus)
 
     # --- 企業規模 ---
     review_count = metrics.openwork_review_count if metrics else None
     employee_count = getattr(metrics, "employee_count", None) if metrics else None
     size_score = _to_size_score(employee_count, review_count)
 
-    # --- 自社開発度 ---
-    self_dev_score = 1.0 if company.estimated_category == "自社開発" else 0.3
+    # --- 自社開発度（4段階） ---
+    _category_scores: dict[str, float] = {
+        "自社開発": 1.0,
+        "メーカー情報子会社": 0.5,
+        "SIer": 0.3,
+        "その他": 0.3,
+    }
+    self_dev_score = _category_scores.get(company.estimated_category, 0.3)
 
     # --- 立地 ---
     preferred = set(profile.get("preferred_prefectures", []))

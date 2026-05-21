@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     haiku_model: str = "claude-haiku-4-5"
 
     # Phase 1 定数
-    phase1_batch_count: int = 3
+    phase1_batch_count: int = 6
     phase1_companies_per_batch: int = 50
     phase1_max_tokens: int = 8000
     phase1_temperature: float = 0.7

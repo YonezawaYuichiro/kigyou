@@ -7,12 +7,44 @@ import json
 
 import pandas as pd
 import streamlit as st
+from anthropic import Anthropic
 from sqlalchemy import select
 
 from backend.api.scorer import calc_score, load_profile
-from backend.config import DATA_DIR
+from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
 from backend.models import Company, CompanyMetrics
+
+
+@st.cache_resource
+def _get_anthropic() -> Anthropic:
+    return Anthropic(api_key=settings.anthropic_api_key)
+
+
+def _run_entry_analysis(company_data: dict, user_profile: dict) -> dict | None:
+    """Claude Haiku で就職難易度・必要スキルを分析する。"""
+    company_info = "\n".join(
+        [
+            f"企業名: {company_data['name']}",
+            f"カテゴリ: {company_data['estimated_category']}",
+            f"技術スタック: {', '.join(company_data['tech_stack'])}",
+            f"採用職種: {', '.join(company_data.get('hiring_roles', []))}",
+            f"従業員数: {company_data.get('employee_count') or 'N/A'}",
+            f"上場区分: {'上場' if company_data.get('is_listed') else '非上場' if company_data.get('is_listed') is False else 'N/A'}",
+            f"平均年収: {company_data.get('avg_annual_salary') or 'N/A'}万円",
+            f"OpenWork評価: {company_data.get('openwork_score') or 'N/A'}",
+        ]
+    )
+    user_skills = f"保有スキル: {', '.join(user_profile.get('required_skills', []) + user_profile.get('bonus_skills', []))}"
+    template = (PROMPTS_DIR / "entry_analysis.txt").read_text(encoding="utf-8")
+    prompt = template.format(company_info=company_info, user_skills=user_skills)
+    resp = _get_anthropic().messages.create(
+        model=settings.haiku_model,
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return json.loads(resp.content[0].text)
+
 
 PROFILE_PATH = DATA_DIR / "my_profile.json"
 
@@ -124,6 +156,7 @@ def _fetch_companies() -> list[dict]:
                     "hq_prefecture": c.hq_prefecture,
                     "estimated_category": c.estimated_category,
                     "tech_stack": list(c.tech_stack or []),
+                    "hiring_roles": list(c.hiring_roles or []),
                     "llm_confidence": c.llm_confidence,
                     "openwork_score": m.openwork_score if m else None,
                     "avg_overtime_hours": m.avg_overtime_hours if m else None,
@@ -136,6 +169,10 @@ def _fetch_companies() -> list[dict]:
                     "is_listed": m.is_listed if m else None,
                     "founded_year": m.founded_year if m else None,
                     "green_url": m.green_url if m else None,
+                    "ow_score_growth": m.ow_score_growth if m else None,
+                    "ow_score_morale": m.ow_score_morale if m else None,
+                    "ow_score_openness": m.ow_score_openness if m else None,
+                    "remote_work_policy": m.remote_work_policy if m else None,
                 }
             )
     return rows
@@ -166,6 +203,10 @@ for r in raw_rows:
         m.paid_leave_rate = r["paid_leave_rate"]  # type: ignore[union-attr]
         m.openwork_review_count = r["openwork_review_count"]  # type: ignore[union-attr]
         m.employee_count = r["employee_count"]  # type: ignore[union-attr]
+        m.ow_score_growth = r["ow_score_growth"]  # type: ignore[union-attr]
+        m.ow_score_morale = r["ow_score_morale"]  # type: ignore[union-attr]
+        m.ow_score_openness = r["ow_score_openness"]  # type: ignore[union-attr]
+        m.remote_work_policy = r["remote_work_policy"]  # type: ignore[union-attr]
 
     if apply_filters:
         filters = active_profile["hard_filters"]
@@ -297,3 +338,40 @@ if selected_name:
         links.append(f"[Green]({detail['green_url']})")
     if links:
         st.markdown("  |  ".join(links))
+
+    # ─── 就職分析 ──────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("就職分析")
+    cache_key = f"entry_analysis_{detail['name']}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = None
+
+    if st.button("🔍 就職分析を実行（Claude Haiku）"):
+        with st.spinner("分析中..."):
+            try:
+                st.session_state[cache_key] = _run_entry_analysis(detail, active_profile)
+            except Exception as e:
+                st.error(f"分析失敗: {e}")
+
+    analysis = st.session_state.get(cache_key)
+    if analysis:
+        diff_color = {"低": "green", "中": "orange", "高": "red"}.get(
+            analysis.get("difficulty", ""), "gray"
+        )
+        st.markdown(
+            f"**就職難易度**: :{diff_color}[{analysis['difficulty']}]　{analysis['difficulty_reason']}"
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**重要スキル**")
+            for s in analysis.get("required_skills", []):
+                st.markdown(f"- {s}")
+        with col_b:
+            st.markdown("**スキルギャップ**")
+            gaps = analysis.get("skill_gap", [])
+            if gaps:
+                for s in gaps:
+                    st.markdown(f"- ⚠️ {s}")
+            else:
+                st.markdown("✅ ギャップなし")
+        st.info(analysis.get("advice", ""))
