@@ -126,19 +126,23 @@ def _normalize_row(row: dict) -> dict:
     }
 
 
-def _load_existing_names() -> list[str]:
-    """DBに登録済みの企業名を返す（除外リストに使用）。"""
+def _load_existing_companies() -> tuple[list[str], set[str], set[str]]:
+    """DBに登録済みの企業名・正規化名・URLを返す（除外チェックに使用）。"""
     try:
         from sqlalchemy import select
 
         from backend.models import Company
+        from backend.seed.houjin_lookup import _normalize_corp_name
 
         with get_session() as session:
-            names = session.scalars(select(Company.name)).all()
-            return list(names)
+            rows = session.execute(select(Company.name, Company.official_url)).all()
+        names = [r.name for r in rows]
+        norm_names = {_normalize_corp_name(n) for n in names if _normalize_corp_name(n)}
+        urls = {r.official_url for r in rows if r.official_url}
+        return names, norm_names, urls
     except Exception as e:
-        logger.warning("既存企業名の取得失敗（DBなし or 未初期化）: %s", e)
-        return []
+        logger.warning("既存企業の取得失敗（DBなし or 未初期化）: %s", e)
+        return [], set(), set()
 
 
 def generate_candidates() -> None:
@@ -147,8 +151,10 @@ def generate_candidates() -> None:
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     template = _load_prompt_template()
 
+    from backend.seed.houjin_lookup import _normalize_corp_name
+
     all_companies: list[dict] = []
-    excluded_names: list[str] = _load_existing_names()
+    excluded_names, excluded_norm_names, excluded_urls = _load_existing_companies()
     if excluded_names:
         logger.info("除外リスト: DB登録済み %d社", len(excluded_names))
 
@@ -157,9 +163,26 @@ def generate_candidates() -> None:
         prompt = _build_prompt(template, excluded_names)
         companies = _call_llm_once(client, prompt, batch_num)
         for c in companies:
-            if c.get("name") and c["name"] not in excluded_names:
-                all_companies.append(_normalize_row(c))
-                excluded_names.append(c["name"])
+            name = c.get("name", "")
+            url = c.get("official_url", "")
+            norm = _normalize_corp_name(name)
+            # 名前（完全一致）・正規化名・URLの3重チェックで重複を弾く
+            if not name:
+                continue
+            if name in excluded_names:
+                continue
+            if norm and norm in excluded_norm_names:
+                logger.debug("正規化名重複でスキップ: %s", name)
+                continue
+            if url and url in excluded_urls:
+                logger.debug("URL重複でスキップ: %s (%s)", name, url)
+                continue
+            all_companies.append(_normalize_row(c))
+            excluded_names.append(name)
+            if norm:
+                excluded_norm_names.add(norm)
+            if url:
+                excluded_urls.add(url)
 
     df = pd.DataFrame(all_companies, columns=_CSV_COLUMNS)
     df.fillna("").to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
