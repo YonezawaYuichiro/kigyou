@@ -77,6 +77,39 @@ def _save_log(
         logger.warning("ProcessingLog 保存失敗: %s", log_err)
 
 
+def _call_gemini_once(prompt: str, batch_num: int) -> list[dict]:
+    """Gemini API で1回のLLM呼び出しを実行する。失敗時は空リストを返す。"""
+    from google import genai
+
+    start = time.monotonic()
+    raw_response: str | None = None
+    phase = "phase_1_generate"
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+        )
+        raw_response = response.text
+        companies = _parse_llm_response(raw_response)
+        duration_ms = int((time.monotonic() - start) * 1000)
+        logger.info("バッチ%d(Gemini): %d社取得", batch_num, len(companies))
+        _save_log(phase, "success", duration_ms, raw_response=raw_response)
+        return companies
+    except LLMResponseError as e:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        logger.warning("バッチ%d(Gemini) JSONパース失敗: %s", batch_num, e)
+        _save_log(phase, "failure", duration_ms, str(e), raw_response)
+        return []
+    except Exception as e:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        logger.error("バッチ%d(Gemini) API呼び出し失敗: %s", batch_num, e)
+        _save_log(phase, "failure", duration_ms, str(e), raw_response)
+        return []
+    finally:
+        time.sleep(settings.sonnet_sleep_seconds)
+
+
 def _call_llm_once(
     client: anthropic.Anthropic,
     prompt: str,
@@ -137,7 +170,7 @@ def _load_existing_companies() -> tuple[list[str], set[str], set[str]]:
         with get_session() as session:
             rows = session.execute(select(Company.name, Company.official_url)).all()
         names = [r.name for r in rows]
-        norm_names = {_normalize_corp_name(n) for n in names if _normalize_corp_name(n)}
+        norm_names = {_normalize_corp_name(n) for n in names if len(_normalize_corp_name(n)) >= 3}
         urls = {r.official_url for r in rows if r.official_url}
         return names, norm_names, urls
     except Exception as e:
@@ -159,9 +192,18 @@ def generate_candidates() -> None:
         logger.info("除外リスト: DB登録済み %d社", len(excluded_names))
 
     for batch_num in range(1, settings.phase1_batch_count + 1):
-        logger.info("バッチ %d/%d 開始", batch_num, settings.phase1_batch_count)
+        p = settings.phase1_provider.lower()
+        use_gemini = bool(settings.gemini_api_key) and (
+            p == "gemini" or (p == "both" and batch_num % 2 == 0)
+        )
+        provider = "Gemini" if use_gemini else "Claude"
+        logger.info("バッチ %d/%d 開始 (%s)", batch_num, settings.phase1_batch_count, provider)
         prompt = _build_prompt(template, excluded_names)
-        companies = _call_llm_once(client, prompt, batch_num)
+        companies = (
+            _call_gemini_once(prompt, batch_num)
+            if use_gemini
+            else _call_llm_once(client, prompt, batch_num)
+        )
         for c in companies:
             name = c.get("name", "")
             url = c.get("official_url", "")
@@ -171,15 +213,15 @@ def generate_candidates() -> None:
                 continue
             if name in excluded_names:
                 continue
-            if norm and norm in excluded_norm_names:
-                logger.debug("正規化名重複でスキップ: %s", name)
+            if norm and len(norm) >= 3 and norm in excluded_norm_names:
+                logger.info("正規化名重複でスキップ: %s (norm=%s)", name, norm)
                 continue
             if url and url in excluded_urls:
                 logger.debug("URL重複でスキップ: %s (%s)", name, url)
                 continue
             all_companies.append(_normalize_row(c))
             excluded_names.append(name)
-            if norm:
+            if norm and len(norm) >= 3:
                 excluded_norm_names.add(norm)
             if url:
                 excluded_urls.add(url)

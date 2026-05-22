@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     # LLM モデル名
     sonnet_model: str = "claude-sonnet-4-6"
     haiku_model: str = "claude-haiku-4-5"
+    gemini_model: str = "gemini-2.5-flash"
+
+    # Gemini API キー（空の場合は Claude のみ使用）
+    gemini_api_key: str = Field(default="", description="Gemini API キー")
+
+    # Phase 1 プロバイダー: "claude" | "gemini" | "both"（交互）
+    phase1_provider: str = Field(default="both", description="Phase1 LLM プロバイダー")
 
     # Phase 1 定数
     phase1_batch_count: int = 6

@@ -279,6 +279,27 @@ st.dataframe(
     },
 )
 
+# ─── 手動企業追加 ─────────────────────────────────────────────────────────
+with st.expander("企業を手動追加"):
+    with st.form("manual_add_form"):
+        url_input = st.text_input("企業のURL（例: https://hutzper.com/）")
+        submitted = st.form_submit_button("追加")
+    if submitted and url_input.strip():
+        import contextlib
+        import io
+
+        from backend.seed.manual_add import add_companies
+
+        buf = io.StringIO()
+        with st.spinner("追加中..."):
+            try:
+                with contextlib.redirect_stdout(buf):
+                    add_companies([url_input.strip()])
+                st.success(buf.getvalue())
+                _fetch_companies.clear()
+            except Exception as e:
+                st.error(f"追加失敗: {e}")
+
 # ─── 企業詳細 ──────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("企業詳細")
