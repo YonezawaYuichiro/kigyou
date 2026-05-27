@@ -7,12 +7,14 @@ import pandas as pd
 
 from backend.config import DATA_DIR, settings
 from backend.exceptions import PhaseInputError
+from backend.seed.dimensions_extractor import extract_all_companies
 from backend.seed.enricher import enrich_companies
 from backend.seed.green_scraper import scrape_green
 from backend.seed.houjin_lookup import validate_companies
 from backend.seed.llm_generator import generate_candidates
 from backend.seed.loader import load_companies, load_green_metrics, load_openwork_metrics
 from backend.seed.openwork_scraper import scrape_openwork
+from backend.seed.vector_builder import build_all_vectors
 from backend.seed.verifier import verify_candidates
 
 logger = logging.getLogger(__name__)
@@ -69,13 +71,19 @@ def main() -> None:
         load_openwork_metrics()
         load_green_metrics()
 
+        print("\n[Phase 3c] ディメンション抽出（Gemini検索 + Haiku）")
+        extract_all_companies()
+
+        print("\n[Phase 3d] ベクトル計算（算術計算）")
+        build_all_vectors()
+
     except PhaseInputError as e:
         logger.error("フェーズゲート失敗: %s", e)
         print(f"\n[ERROR] 前フェーズの出力が不正です: {e}", file=sys.stderr)
         sys.exit(1)
 
     print("\n" + "=" * 60)
-    print("[run_all] Step 0 完了！企業マスタが構築されました。")
+    print("[run_all] Step 0 完了！企業マスタ + V2ディメンション/ベクトルが構築されました。")
     print("=" * 60)
 
 

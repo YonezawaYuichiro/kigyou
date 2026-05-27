@@ -211,3 +211,38 @@
   - Green: 16社取得（ベネフィット・ワン, キーエンス, アイテック阪急阪神 等）
   - OpenWork: 5社の ow_score_treatment が正常に取得
   - DB: Company 134社, CompanyMetrics 30件, employee_count 16件, ow_score_treatment 5件
+
+---
+
+## 2026-05-27: V2 マッチングエンジン全実装（Phase 1〜4）
+
+- **実装内容**:
+  - `docker-compose.yml` — Postgres イメージを `postgres:16-alpine` → `pgvector/pgvector:pg16` に変更
+  - `docker/init.sql` — `CREATE EXTENSION IF NOT EXISTS vector;` 追加（コンテナ初期化時に自動実行）
+  - `pyproject.toml` — `pgvector>=0.3.0` を依存に追加
+  - `backend/models.py` — V2用4テーブル追加: `CompanyDimensions`（26★項目+証拠テキスト）/ `CompanyVector`（VECTOR(10)）/ `UserProfile`（tech_level_score + dimension_weights）/ `MatchResult`（スナップショット）。Company に relationships 追加
+  - `alembic/versions/f1e2d3c4b5a6_add_v2_tables.py` — 手動マイグレーション。VECTOR型はAlembic自動検出不可のため `op.execute()` で追加
+  - `backend/seed/dimensions_extractor.py` — Phase 3c: Gemini 検索グラウンディング（4クエリ）+ Haiku 4.5 で26★項目JSON抽出、overall_confidence 算出、CompanyDimensions upsert
+  - `backend/seed/vector_builder.py` — Phase 3d: CompanyDimensions + CompanyMetrics から10次元スコアを算術計算、CompanyVector upsert。LLM不要
+  - `backend/seed/run_all.py` — Phase 3c（ディメンション抽出）と Phase 3d（ベクトル計算）を追加
+  - `backend/api/profile_manager.py` — UserProfile DB管理: Sonnet 4.6 で tech_level_score 算出、hard_constraints + soft_preferences + tech_level_score から10次元重みベクトルをL1正規化生成
+  - `pages/1_profile_setup.py` — 3ステップウィザード: スキル入力 → 条件設定（残業上限/リモート/勤務地/優先事項）→ 確認・保存（Sonnet 4.6 実務力評価）
+  - `backend/api/matching_engine.py` — pgvector コサイン類似度クエリ（`1 - (dim_scores <=> :vec ::vector)`）でTOP50取得、tech_level によるリアリスティックスコア割引
+  - `app.py` — 3タブ構成に改修: 「V2 理想企業」「V2 受けるべき企業」「V1 旧スコアリング」
+
+- **設計判断**:
+  - Alembic は VECTOR 型を自動検出できないため `--autogenerate` は使わず手動で `op.execute("ALTER TABLE ... ADD COLUMN dim_scores vector(10)")` を記述
+  - pgvector の配列インデックスは1始まりのため SQL では `dim_scores[10]` が Python の `dim[9]`（開発環境次元）に対応
+  - `_search_with_gemini()` は `settings.gemini_api_key` が空なら即 `""` を返す。Gemini 未設定でも Haiku 抽出だけで動作継続できる
+  - `@st.cache_data` はモジュールレベルに定義が必要なため `_fetch_companies()` を `with tab_v1:` ブロック外に移動
+  - UserProfile の `dimension_weights` は SQLAlchemy `mapped_column(Vector(10))` で定義（`Mapped[]` 型注釈は pgvector が未対応のためスキップ）
+
+- **動作確認**:
+  - `python -m py_compile app.py pages/1_profile_setup.py backend/api/matching_engine.py backend/api/profile_manager.py backend/seed/dimensions_extractor.py backend/seed/vector_builder.py` → エラーなし
+  - `ruff check` → All checks passed（F401/C408/UP017 を修正）
+  - `pytest tests/ -q` → 26/26 passed
+
+- **残課題**:
+  - Docker pgvector イメージへの切り替え後、既存 `postgres_data` volume との互換性確認が必要（`pg_dump` でバックアップ推奨）
+  - Phase 3c/3d の実際の実行（`python -m backend.seed.dimensions_extractor`）は Gemini API キー設定後に実施
+  - Phase 5: カバレッジ測定（★項目70%以上埋まりを目標）、tech_level_score キャリブレーション

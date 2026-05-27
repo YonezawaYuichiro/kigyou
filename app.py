@@ -1,15 +1,23 @@
-"""Step 3: GradMatch-AI 推薦UI（Streamlit）。
+"""GradMatch-AI 推薦UI（Streamlit）。
 
 起動: streamlit run app.py
+
+タブ構成:
+  タブ1 🏆 理想企業     - V2 ベクトルマッチング（ideal_score 降順）
+  タブ2 🎯 受けるべき企業 - V2 合格可能性スコア（realistic_score 降順）
+  タブ3 📊 従来スコアリング - V1 ルールベース5軸（後方互換）
 """
 
 import json
+import uuid
 
 import pandas as pd
 import streamlit as st
 from anthropic import Anthropic
 from sqlalchemy import select
 
+from backend.api.matching_engine import compute_matches
+from backend.api.profile_manager import load_or_create_profile
 from backend.api.scorer import calc_score, load_profile
 from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
@@ -43,13 +51,25 @@ def _run_entry_analysis(company_data: dict, user_profile: dict) -> dict | None:
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}],
     )
-    return json.loads(resp.content[0].text)
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1]) if len(lines) > 2 else raw
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 PROFILE_PATH = DATA_DIR / "my_profile.json"
 
 st.set_page_config(page_title="GradMatch-AI", page_icon="🎯", layout="wide")
 st.title("🎯 GradMatch-AI — 企業マッチング")
+
+# ─── セッション管理（V2用） ────────────────────────────────────────────────
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())
+_session_id: str = st.session_state["session_id"]
 
 # ─── サイドバー: 重みスライダー ────────────────────────────────────────────
 st.sidebar.header("重み設定")
@@ -111,10 +131,16 @@ prefs_raw = st.sidebar.text_area(
     "希望都道府県（カンマ区切り）",
     value=", ".join(profile.get("preferred_prefectures", [])),
 )
+quals_raw = st.sidebar.text_area(
+    "保有資格（カンマ区切り）",
+    value=", ".join(profile.get("qualifications", [])),
+    help="例: 応用情報技術者, AWS認定\n資格は技術成長性スコアにボーナスとして反映されます（最大 +0.25）",
+)
 
 req_skills = [s.strip() for s in req_skills_raw.split(",") if s.strip()]
 bonus_skills = [s.strip() for s in bonus_skills_raw.split(",") if s.strip()]
 preferred_prefs = [s.strip() for s in prefs_raw.split(",") if s.strip()]
+qualifications = [s.strip() for s in quals_raw.split(",") if s.strip()]
 
 active_profile = {
     **profile,
@@ -126,6 +152,7 @@ active_profile = {
     "required_skills": req_skills,
     "bonus_skills": bonus_skills,
     "preferred_prefectures": preferred_prefs,
+    "qualifications": qualifications,
 }
 
 st.sidebar.divider()
@@ -136,11 +163,149 @@ if st.sidebar.button("💾 プロフィールに保存"):
     updated["required_skills"] = req_skills
     updated["bonus_skills"] = bonus_skills
     updated["preferred_prefectures"] = preferred_prefs
+    updated["qualifications"] = qualifications
     PROFILE_PATH.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
     st.sidebar.success("保存しました")
 
 
-# ─── メイン: スコアリング ─────────────────────────────────────────────────
+# ─── メイン: 3タブ ───────────────────────────────────────────────────────
+tab_ideal, tab_realistic, tab_v1 = st.tabs(
+    ["🏆 理想企業（V2）", "🎯 受けるべき企業（V2）", "📊 従来スコアリング（V1）"]
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V2 共通: マッチング実行
+# ═══════════════════════════════════════════════════════════════════════════
+def _run_v2_matches() -> dict:
+    """V2 マッチングを実行し session_state にキャッシュする。"""
+    if "v2_matches" not in st.session_state:
+        with st.spinner("ベクトルマッチング実行中..."):
+            user_profile = load_or_create_profile(_session_id)
+            st.session_state["v2_matches"] = compute_matches(user_profile)
+            st.session_state["v2_tech_level"] = user_profile.tech_level_score or 0.5
+    return st.session_state["v2_matches"]
+
+
+def _render_v2_table(rows: list[dict], score_col: str, score_label: str) -> str | None:
+    """V2結果テーブルを描画して選択された企業名を返す。"""
+    if not rows:
+        st.info("該当企業が見つかりませんでした。プロフィール設定を確認してください。")
+        return None
+
+    df = pd.DataFrame(
+        [
+            {
+                "企業名": r["name"],
+                score_label: r[score_col],
+                "信頼度": "⚠️" if (r.get("overall_confidence") or 1.0) < 0.4 else "✅",
+                "カテゴリ": r["estimated_category"],
+                "都道府県": r["hq_prefecture"],
+                "OW評価": r.get("openwork_score"),
+                "残業h": r.get("avg_overtime_hours"),
+                "年収(万)": r.get("avg_annual_salary"),
+            }
+            for r in rows
+        ]
+    )
+    event = st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            score_label: st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.3f"),
+            "OW評価": st.column_config.NumberColumn(format="%.2f ★"),
+            "残業h": st.column_config.NumberColumn(format="%.1f h"),
+            "年収(万)": st.column_config.NumberColumn(format="%d 万円"),
+        },
+    )
+    selected = event.selection.rows if event and event.selection else []
+    return rows[selected[0]]["name"] if selected else None
+
+
+def _render_v2_detail(name: str, rows: list[dict]) -> None:
+    """V2企業詳細を描画する。"""
+    detail = next((r for r in rows if r["name"] == name), None)
+    if not detail:
+        return
+    st.subheader(f"企業詳細: {name}")
+    conf = detail.get("overall_confidence")
+    if conf is not None and conf < 0.4:
+        st.warning(
+            f"情報不足（信頼度 {conf:.2f}）: LLM抽出データが少ないため精度が低い可能性があります。"
+        )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("理想スコア", f"{detail['ideal_score']:.3f}")
+        st.metric("現実的スコア", f"{detail['realistic_score']:.3f}")
+    with col2:
+        st.metric("残業", f"{detail.get('avg_overtime_hours') or 'N/A'} h/月")
+        st.metric("年収", f"{detail.get('avg_annual_salary') or 'N/A'} 万円")
+    with col3:
+        st.metric("心理的安全性", f"{detail.get('psychological_safety_score') or 'N/A'} / 5")
+        st.metric("若手裁量", f"{detail.get('junior_authority_score') or 'N/A'} / 5")
+
+    if detail.get("tech_env_evidence"):
+        st.info(f"**開発環境**: {detail['tech_env_evidence']}")
+
+    links = []
+    if detail.get("official_url"):
+        links.append(f"[公式サイト]({detail['official_url']})")
+    if detail.get("openwork_url"):
+        links.append(f"[OpenWork]({detail['openwork_url']})")
+    if detail.get("green_url"):
+        links.append(f"[Green]({detail['green_url']})")
+    if links:
+        st.markdown("  |  ".join(links))
+
+
+# ─── タブ1: 理想企業 ───────────────────────────────────────────────────────
+with tab_ideal:
+    tech_level = st.session_state.get("v2_tech_level", 0.5)
+    st.caption(
+        f"あなたの実務力スコア: **{tech_level:.2f}** / 1.0　　[プロフィール設定](./1_profile_setup)で更新できます。"
+    )
+
+    col_refresh, col_info = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 再計算", key="refresh_ideal"):
+            for k in [k for k in st.session_state if k.startswith("v2_")]:
+                del st.session_state[k]
+            st.rerun()
+
+    matches = _run_v2_matches()
+    ideal_rows = matches.get("ideal", [])
+    st.subheader(f"理想企業ランキング: {len(ideal_rows)} 社")
+
+    selected_ideal = _render_v2_table(ideal_rows, "ideal_score", "理想スコア")
+    if selected_ideal:
+        st.session_state["v2_selected_ideal"] = selected_ideal
+
+    selected = st.session_state.get("v2_selected_ideal")
+    if selected:
+        st.divider()
+        _render_v2_detail(selected, ideal_rows)
+
+# ─── タブ2: 受けるべき企業 ─────────────────────────────────────────────────
+with tab_realistic:
+    matches = _run_v2_matches()
+    realistic_rows = matches.get("realistic", [])
+    st.subheader(f"受けるべき企業ランキング: {len(realistic_rows)} 社")
+    st.caption("理想スコアを実務力スコアとの差（技術レベルギャップ）で補正したランキングです。")
+
+    selected_real = _render_v2_table(realistic_rows, "realistic_score", "現実的スコア")
+    if selected_real:
+        st.session_state["v2_selected_real"] = selected_real
+
+    selected = st.session_state.get("v2_selected_real")
+    if selected:
+        st.divider()
+        _render_v2_detail(selected, realistic_rows)
+
+
 @st.cache_data(ttl=300)
 def _fetch_companies() -> list[dict]:
     rows = []
@@ -178,221 +343,252 @@ def _fetch_companies() -> list[dict]:
     return rows
 
 
-raw_rows = _fetch_companies()
+# ─── タブ3: 従来スコアリング（V1） ────────────────────────────────────────
+with tab_v1:
+    raw_rows = _fetch_companies()
 
-results = []
-for r in raw_rows:
-    # Company/CompanyMetrics の代わりに dict から疑似オブジェクトを使う
-    class _C:
-        pass
+    results = []
+    for r in raw_rows:
 
-    c = _C()
-    c.tech_stack = r["tech_stack"]
-    c.estimated_category = r["estimated_category"]
-    c.hq_prefecture = r["hq_prefecture"]
+        class _C:  # noqa: N801
+            pass
 
-    m: CompanyMetrics | None = None
-    if (
-        r["openwork_score"] is not None
-        or r["avg_overtime_hours"] is not None
-        or r["employee_count"] is not None
-    ):
-        m = _C()  # type: ignore[assignment]
-        m.openwork_score = r["openwork_score"]  # type: ignore[union-attr]
-        m.avg_overtime_hours = r["avg_overtime_hours"]  # type: ignore[union-attr]
-        m.paid_leave_rate = r["paid_leave_rate"]  # type: ignore[union-attr]
-        m.openwork_review_count = r["openwork_review_count"]  # type: ignore[union-attr]
-        m.employee_count = r["employee_count"]  # type: ignore[union-attr]
-        m.ow_score_growth = r["ow_score_growth"]  # type: ignore[union-attr]
-        m.ow_score_morale = r["ow_score_morale"]  # type: ignore[union-attr]
-        m.ow_score_openness = r["ow_score_openness"]  # type: ignore[union-attr]
-        m.remote_work_policy = r["remote_work_policy"]  # type: ignore[union-attr]
+        c = _C()
+        c.tech_stack = r["tech_stack"]
+        c.estimated_category = r["estimated_category"]
+        c.hq_prefecture = r["hq_prefecture"]
 
-    if apply_filters:
-        filters = active_profile["hard_filters"]
-        if filters.get("max_overtime_hours") and r["avg_overtime_hours"] is not None:
-            if r["avg_overtime_hours"] > filters["max_overtime_hours"]:
-                continue
-        if filters.get("min_openwork_score") and r["openwork_score"] is not None:
-            if r["openwork_score"] < filters["min_openwork_score"]:
-                continue
+        m: CompanyMetrics | None = None
+        if (
+            r["openwork_score"] is not None
+            or r["avg_overtime_hours"] is not None
+            or r["employee_count"] is not None
+        ):
+            m = _C()  # type: ignore[assignment]
+            m.openwork_score = r["openwork_score"]  # type: ignore[union-attr]
+            m.avg_overtime_hours = r["avg_overtime_hours"]  # type: ignore[union-attr]
+            m.paid_leave_rate = r["paid_leave_rate"]  # type: ignore[union-attr]
+            m.openwork_review_count = r["openwork_review_count"]  # type: ignore[union-attr]
+            m.employee_count = r["employee_count"]  # type: ignore[union-attr]
+            m.ow_score_growth = r["ow_score_growth"]  # type: ignore[union-attr]
+            m.ow_score_morale = r["ow_score_morale"]  # type: ignore[union-attr]
+            m.ow_score_openness = r["ow_score_openness"]  # type: ignore[union-attr]
+            m.remote_work_policy = r["remote_work_policy"]  # type: ignore[union-attr]
 
-    score_result = calc_score(c, m, active_profile)  # type: ignore[arg-type]
-    results.append(
-        {
-            **r,
-            "score": score_result["total"],
-            "axes": score_result["axes"],
-            "data_coverage": score_result["data_coverage"],
-        }
-    )
+        if apply_filters:
+            filters = active_profile["hard_filters"]
+            if filters.get("max_overtime_hours") and r["avg_overtime_hours"] is not None:
+                if r["avg_overtime_hours"] > filters["max_overtime_hours"]:
+                    continue
+            if filters.get("min_openwork_score") and r["openwork_score"] is not None:
+                if r["openwork_score"] < filters["min_openwork_score"]:
+                    continue
 
-results.sort(key=lambda x: x["score"], reverse=True)
-if min_coverage > 0:
-    results = [r for r in results if r["data_coverage"] >= min_coverage]
-
-# ─── テーブル表示 ──────────────────────────────────────────────────────────
-st.subheader(f"マッチング結果: {len(results)} 社")
-
-df_src = pd.DataFrame(results)
-df = df_src[
-    [
-        "name",
-        "score",
-        "data_coverage",
-        "estimated_category",
-        "hq_prefecture",
-        "openwork_score",
-        "avg_overtime_hours",
-        "avg_annual_salary",
-        "employee_count",
-        "llm_confidence",
-    ]
-].copy()
-# None を NaN に変換（object 列のまま "None" 文字列で表示されるのを防ぐ）
-for col in ["openwork_score", "avg_overtime_hours", "avg_annual_salary", "employee_count"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-df["data_coverage"] = df["data_coverage"].apply(lambda n: "★" * int(n) + "☆" * (5 - int(n)))
-df.columns = [
-    "企業名",
-    "マッチスコア",
-    "充実度",
-    "カテゴリ",
-    "都道府県",
-    "OW評価",
-    "残業h",
-    "年収(万)",
-    "従業員数",
-    "信頼度",
-]
-
-st.dataframe(
-    df,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "マッチスコア": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.3f"),
-        "OW評価": st.column_config.NumberColumn(format="%.2f ★"),
-        "残業h": st.column_config.NumberColumn(format="%.1f h"),
-        "年収(万)": st.column_config.NumberColumn(format="%d 万円"),
-        "従業員数": st.column_config.NumberColumn(format="%d 名"),
-    },
-)
-
-# ─── 手動企業追加 ─────────────────────────────────────────────────────────
-with st.expander("企業を手動追加"):
-    with st.form("manual_add_form"):
-        url_input = st.text_input("企業のURL（例: https://hutzper.com/）")
-        submitted = st.form_submit_button("追加")
-    if submitted and url_input.strip():
-        import contextlib
-        import io
-
-        from backend.seed.manual_add import add_companies
-
-        buf = io.StringIO()
-        with st.spinner("追加中..."):
-            try:
-                with contextlib.redirect_stdout(buf):
-                    add_companies([url_input.strip()])
-                st.success(buf.getvalue())
-                _fetch_companies.clear()
-            except Exception as e:
-                st.error(f"追加失敗: {e}")
-
-# ─── 企業詳細 ──────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("企業詳細")
-
-selected_name = st.selectbox("企業を選択", [r["name"] for r in results])
-if selected_name:
-    detail = next(r for r in results if r["name"] == selected_name)
-
-    # スコア根拠グラフ
-    _axis_labels = {
-        "tech_growth": "技術成長性",
-        "wlb": "WLB",
-        "company_size": "企業規模",
-        "self_developed": "自社開発度",
-        "location": "立地",
-    }
-    axes = detail["axes"]
-    ax_df = pd.DataFrame(
-        {"スコア": [axes[k] for k in _axis_labels]},
-        index=list(_axis_labels.values()),
-    )
-    cov = detail["data_coverage"]
-    detail_col, chart_col = st.columns([2, 3])
-    with detail_col:
-        st.metric("マッチスコア", f"{detail['score']:.3f}")
-        st.caption(f"データ充実度: {'★' * cov}{'☆' * (5 - cov)} ({cov}/5項目)")
-    with chart_col:
-        st.bar_chart(ax_df, horizontal=True, height=200)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("OpenWork 評価", f"{detail['openwork_score'] or 'N/A'}")
-        st.metric("従業員数", f"{detail['employee_count'] or 'N/A'} 名")
-    with col2:
-        st.metric("残業時間", f"{detail['avg_overtime_hours'] or 'N/A'} h/月")
-        st.metric("平均年収", f"{detail['avg_annual_salary'] or 'N/A'} 万円")
-        st.metric("平均年齢", f"{detail['average_age'] or 'N/A'} 歳")
-    with col3:
-        st.metric("カテゴリ", detail["estimated_category"])
-        st.metric("所在地", detail["hq_prefecture"])
-        listed_label = (
-            "上場" if detail["is_listed"] else ("非上場" if detail["is_listed"] is False else "N/A")
+        score_result = calc_score(c, m, active_profile)  # type: ignore[arg-type]
+        results.append(
+            {
+                **r,
+                "score": score_result["total"],
+                "axes": score_result["axes"],
+                "data_coverage": score_result["data_coverage"],
+            }
         )
-        st.metric("上場区分", listed_label)
 
-    founded = detail.get("founded_year")
-    st.markdown(
-        f"**設立年**: {founded or 'N/A'}年　**技術スタック**: {', '.join(detail['tech_stack']) or 'N/A'}"
+    results.sort(key=lambda x: x["score"], reverse=True)
+    if min_coverage > 0:
+        results = [r for r in results if r["data_coverage"] >= min_coverage]
+
+    header_col, search_col = st.columns([2, 3])
+    with header_col:
+        st.subheader(f"マッチング結果: {len(results)} 社")
+    with search_col:
+        search_query = st.text_input(
+            "🔍 企業名で絞り込み", placeholder="例: サイボウズ", label_visibility="collapsed"
+        )
+
+    filtered = (
+        [r for r in results if search_query.lower() in r["name"].lower()]
+        if search_query
+        else results
     )
 
-    links = []
-    if detail["official_url"]:
-        links.append(f"[公式サイト]({detail['official_url']})")
-    if detail["openwork_url"]:
-        links.append(f"[OpenWork]({detail['openwork_url']})")
-    if detail.get("green_url"):
-        links.append(f"[Green]({detail['green_url']})")
-    if links:
-        st.markdown("  |  ".join(links))
+    df_src = pd.DataFrame(filtered)
+    df = (
+        df_src[
+            [
+                "name",
+                "score",
+                "data_coverage",
+                "estimated_category",
+                "hq_prefecture",
+                "openwork_score",
+                "avg_overtime_hours",
+                "avg_annual_salary",
+                "employee_count",
+                "llm_confidence",
+            ]
+        ].copy()
+        if not df_src.empty
+        else pd.DataFrame()
+    )
+    if not df.empty:
+        for col in ["openwork_score", "avg_overtime_hours", "avg_annual_salary", "employee_count"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["data_coverage"] = df["data_coverage"].apply(lambda n: "★" * int(n) + "☆" * (5 - int(n)))
+        df.columns = [
+            "企業名",
+            "マッチスコア",
+            "充実度",
+            "カテゴリ",
+            "都道府県",
+            "OW評価",
+            "残業h",
+            "年収(万)",
+            "従業員数",
+            "信頼度",
+        ]
 
-    # ─── 就職分析 ──────────────────────────────────────────────────────────
+    event = st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "マッチスコア": st.column_config.ProgressColumn(
+                min_value=0, max_value=1, format="%.3f"
+            ),
+            "OW評価": st.column_config.NumberColumn(format="%.2f ★"),
+            "残業h": st.column_config.NumberColumn(format="%.1f h"),
+            "年収(万)": st.column_config.NumberColumn(format="%d 万円"),
+            "従業員数": st.column_config.NumberColumn(format="%d 名"),
+        },
+    )
+
+    selected_rows = event.selection.rows if event and event.selection else []
+    if selected_rows and filtered:
+        st.session_state["selected_company"] = filtered[selected_rows[0]]["name"]
+
+    with st.expander("企業を手動追加"):
+        with st.form("manual_add_form"):
+            url_input = st.text_input("企業のURL（例: https://hutzper.com/）")
+            submitted = st.form_submit_button("追加")
+        if submitted and url_input.strip():
+            import contextlib
+            import io
+
+            from backend.seed.manual_add import add_companies
+
+            buf = io.StringIO()
+            with st.spinner("追加中..."):
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        add_companies([url_input.strip()])
+                    st.success(buf.getvalue())
+                    _fetch_companies.clear()
+                except Exception as e:
+                    st.error(f"追加失敗: {e}")
+
     st.divider()
-    st.subheader("就職分析")
-    cache_key = f"entry_analysis_{detail['name']}"
-    if cache_key not in st.session_state:
-        st.session_state[cache_key] = None
+    selected_name = st.session_state.get("selected_company")
+    if selected_name and not any(r["name"] == selected_name for r in results):
+        selected_name = None
 
-    if st.button("🔍 就職分析を実行（Claude Haiku）"):
-        with st.spinner("分析中..."):
-            try:
-                st.session_state[cache_key] = _run_entry_analysis(detail, active_profile)
-            except Exception as e:
-                st.error(f"分析失敗: {e}")
+    if selected_name:
+        st.subheader(f"企業詳細: {selected_name}")
+        detail = next(r for r in results if r["name"] == selected_name)
 
-    analysis = st.session_state.get(cache_key)
-    if analysis:
-        diff_color = {"低": "green", "中": "orange", "高": "red"}.get(
-            analysis.get("difficulty", ""), "gray"
+        _axis_labels = {
+            "tech_growth": "技術成長性",
+            "wlb": "WLB",
+            "company_size": "企業規模",
+            "self_developed": "自社開発度",
+            "location": "立地",
+        }
+        axes = detail["axes"]
+        ax_df = pd.DataFrame(
+            {"スコア": [axes[k] for k in _axis_labels]},
+            index=list(_axis_labels.values()),
         )
+        cov = detail["data_coverage"]
+        detail_col, chart_col = st.columns([2, 3])
+        with detail_col:
+            st.metric("マッチスコア", f"{detail['score']:.3f}")
+            st.caption(f"データ充実度: {'★' * cov}{'☆' * (5 - cov)} ({cov}/5項目)")
+        with chart_col:
+            st.bar_chart(ax_df, horizontal=True, height=200)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("OpenWork 評価", f"{detail['openwork_score'] or 'N/A'}")
+            st.metric("従業員数", f"{detail['employee_count'] or 'N/A'} 名")
+        with col2:
+            st.metric("残業時間", f"{detail['avg_overtime_hours'] or 'N/A'} h/月")
+            st.metric("平均年収", f"{detail['avg_annual_salary'] or 'N/A'} 万円")
+            st.metric("平均年齢", f"{detail['average_age'] or 'N/A'} 歳")
+        with col3:
+            st.metric("カテゴリ", detail["estimated_category"])
+            st.metric("所在地", detail["hq_prefecture"])
+            listed_label = (
+                "上場"
+                if detail["is_listed"]
+                else ("非上場" if detail["is_listed"] is False else "N/A")
+            )
+            st.metric("上場区分", listed_label)
+
+        founded = detail.get("founded_year")
         st.markdown(
-            f"**就職難易度**: :{diff_color}[{analysis['difficulty']}]　{analysis['difficulty_reason']}"
+            f"**設立年**: {founded or 'N/A'}年　**技術スタック**: {', '.join(detail['tech_stack']) or 'N/A'}"
         )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**重要スキル**")
-            for s in analysis.get("required_skills", []):
-                st.markdown(f"- {s}")
-        with col_b:
-            st.markdown("**スキルギャップ**")
-            gaps = analysis.get("skill_gap", [])
-            if gaps:
-                for s in gaps:
-                    st.markdown(f"- ⚠️ {s}")
-            else:
-                st.markdown("✅ ギャップなし")
-        st.info(analysis.get("advice", ""))
+
+        links = []
+        if detail["official_url"]:
+            links.append(f"[公式サイト]({detail['official_url']})")
+        if detail["openwork_url"]:
+            links.append(f"[OpenWork]({detail['openwork_url']})")
+        if detail.get("green_url"):
+            links.append(f"[Green]({detail['green_url']})")
+        if links:
+            st.markdown("  |  ".join(links))
+
+        st.divider()
+        st.subheader("就職分析")
+        cache_key = f"entry_analysis_{detail['name']}"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = None
+
+        if st.button("🔍 就職分析を実行（Claude Haiku）"):
+            with st.spinner("分析中..."):
+                try:
+                    result = _run_entry_analysis(detail, active_profile)
+                    if result is None:
+                        st.error(
+                            "分析失敗: LLMの応答をJSONとして解析できませんでした。再度お試しください。"
+                        )
+                    else:
+                        st.session_state[cache_key] = result
+                except Exception as e:
+                    st.error(f"分析失敗: {e}")
+
+        analysis = st.session_state.get(cache_key)
+        if analysis:
+            diff_color = {"低": "green", "中": "orange", "高": "red"}.get(
+                analysis.get("difficulty", ""), "gray"
+            )
+            st.markdown(
+                f"**就職難易度**: :{diff_color}[{analysis['difficulty']}]　{analysis['difficulty_reason']}"
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**重要スキル**")
+                for s in analysis.get("required_skills", []):
+                    st.markdown(f"- {s}")
+            with col_b:
+                st.markdown("**スキルギャップ**")
+                gaps = analysis.get("skill_gap", [])
+                if gaps:
+                    for s in gaps:
+                        st.markdown(f"- ⚠️ {s}")
+                else:
+                    st.markdown("✅ ギャップなし")
+            st.info(analysis.get("advice", ""))

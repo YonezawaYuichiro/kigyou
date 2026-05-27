@@ -18,6 +18,27 @@ logger = logging.getLogger(__name__)
 
 PROFILE_PATH = Path(__file__).parent.parent.parent / "data" / "my_profile.json"
 
+# 資格ボーナステーブル（tech_growth への加算値）
+_QUAL_BONUS_MAP: dict[str, float] = {
+    "応用情報技術者": 0.15,
+    "基本情報技術者": 0.08,
+    "情報処理安全確保支援士": 0.12,
+    "データベーススペシャリスト": 0.10,
+    "ネットワークスペシャリスト": 0.10,
+    "システムアーキテクト": 0.12,
+    "プロジェクトマネージャ": 0.08,
+    "AWS認定": 0.08,
+    "GCP認定": 0.08,
+    "Azure認定": 0.08,
+}
+_QUAL_BONUS_MAX = 0.25  # 資格ボーナスの上限
+
+
+def _qual_bonus(qualifications: list[str]) -> float:
+    """保有資格リストから tech_growth への加算ボーナスを計算する（上限 0.25）。"""
+    total = sum(_QUAL_BONUS_MAP.get(q.strip(), 0.05) for q in qualifications if q.strip())
+    return min(_QUAL_BONUS_MAX, total)
+
 
 def load_profile(path: Path = PROFILE_PATH) -> dict[str, Any]:
     """my_profile.json を読み込む。"""
@@ -107,6 +128,9 @@ def calc_score(
     required_score = len(stack & required) / max(len(required), 1)
     bonus_score = len(stack & bonus) / max(len(bonus), 1) if bonus else 0.0
     tech_stack_score = required_score * 0.7 + bonus_score * 0.3
+    # 保有資格ボーナスを加算（技術資格は tech_growth 軸の底上げに寄与）
+    qual_bonus = _qual_bonus(profile.get("qualifications", []))
+    tech_stack_score = min(1.0, tech_stack_score + qual_bonus)
     # OpenWork「20代成長環境」スコアをブレンド（データあり時）
     ow_growth = getattr(metrics, "ow_score_growth", None) if metrics else None
     if ow_growth is not None:

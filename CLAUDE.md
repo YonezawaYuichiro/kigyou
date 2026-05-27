@@ -1,6 +1,6 @@
 # GradMatch-AI
 
-新卒就活向け企業マッチング・推薦システム。関西IT企業マスタから、ユーザーのプロフィール・希望条件・重み付けに基づいて入社可能性とマッチ度を計算し、逆引き推薦する。
+新卒就活向け企業マッチング・推薦システム。関西IT企業の多次元特徴ベクトルとユーザーの実力・希望ベクトルをコサイン類似度でマッチングし、「理想企業」と「受けるべき企業」を別々にランキングして推薦する（V2）。
 
 ## 🔴 必ず守るルール（最優先）
 
@@ -55,21 +55,23 @@
 
 - **Python 3.11+**
 - **FastAPI** + **Pydantic v2**
-- **SQLAlchemy 2.0**（同期版でOK、Step 0段階では非同期不要）
-- **PostgreSQL 16**（Dockerで起動）
+- **SQLAlchemy 2.0**（同期版）
+- **PostgreSQL 16 + pgvector**（Dockerで起動。`pgvector/pgvector:pg16` イメージ）
 - **Anthropic API**: `claude-sonnet-4-6` / `claude-haiku-4-5`
-  - Sonnet 4.6: 推論・生成（候補生成、スコアリング、根拠生成）
-  - Haiku 4.5: 単純抽出・分類（採用ページ解析、URL検証補助）
-- **httpx**: 外部API呼び出し
+  - Sonnet 4.6: ユーザースキル解釈・複雑な推論
+  - Haiku 4.5: 企業情報の構造化JSON抽出・分類
+- **Google Gemini API**: 企業情報のウェブ検索グラウンディング（既存: `llm_generator.py`）
+- **httpx**: 外部API呼び出し・企業HP取得
 - **pandas**: CSV処理
-- **ruff**: linter + formatter（black/isort/flake8を統合）
+- **ruff**: linter + formatter
 - **pytest** + **pytest-mock**
 
 ### モデルの使い分け原則
 | タスク | モデル | 理由 |
 |---|---|---|
-| 推論・生成・根拠説明 | Sonnet 4.6 | バランス型 |
-| 単純な抽出・分類 | Haiku 4.5 | コスト効率 |
+| 企業情報ウェブ検索 | Gemini | Google検索グラウンディングで最新情報を取得 |
+| 企業情報の構造化抽出・分類 | Haiku 4.5 | コスト効率（$0.0005/社） |
+| ユーザースキル解釈・推論 | Sonnet 4.6 | 精度が重要な場面 |
 | Opus 4.7 | **使わない** | 過剰スペック・コスト高 |
 
 ---
@@ -170,27 +172,22 @@ client.create(model="claude-3", messages=[...])
 
 ---
 
-## データモデルの中核概念
+## データモデルの中核概念（V2）
 
-### Company
-企業マスタ。`corporate_number`（法人番号13桁）でユニーク識別する想定だが、法人番号API承認待ちのため**当面は `official_url` でユニーク**とする。
+### Company / CompanyField / CompanyMetrics
+企業マスタ（`official_url` でユニーク）+ フィールドメタデータ + OpenWork/Green数値。V1から継続利用。
 
-### CompanyField
-各フィールドのメタデータ（情報源・信頼度）。スコア計算時に「LLM推定値だけに依存したスコア」を検出するために使用。
+### CompanyDimensions（V2新規）
+Gemini検索 + HP取得 → Haiku抽出で埋める★26項目。各スコアに**証拠テキスト**を併記して正確性を担保。`overall_confidence < 0.4` の企業はUIで「情報不足」バッジを表示する。
 
-### UserProfile
-ユーザープロフィール。**変更履歴を `ProfileChangeLog` で追跡**することで、「資格取得後にスコアがどう変動したか」を可視化する。
+### CompanyVector（V2新規）
+`CompanyDimensions` + `CompanyMetrics` から算術計算した**10次元スコアベクトル**（pgvector型）。各次元は0.0〜1.0: ビジョン / ビジネスモデル / 財務 / 業界トレンド / カルチャー / キャリア成長 / WLB / 採用透明度 / 開発環境。
 
-### ScoreSnapshot
-スコア計算結果の履歴。プロフィール変更・重み変更・企業情報更新のたびにスナップショットを残し、時系列グラフ表示の元データにする。
+### UserProfile（V2新規）
+`my_profile.json` の移行先。Sonnet 4.6によるスキル解釈で `tech_level_score`（0.0〜1.0）を算出。ユーザーの条件から**10次元重みベクトル**を生成してマッチング精度を高める。
 
-### PriorityWeights
-ユーザーが調整する重み。合計1.0に正規化（validatorで保証）。5項目：
-- `tech_growth`（技術成長性・MLOps適性）
-- `wlb`（ワークライフバランス）
-- `company_size`（企業規模・安定性）
-- `self_developed`（自社開発度・資本独立性）
-- `location`（勤務地・京阪神優先）
+### MatchResult（V2新規）
+マッチング結果のスナップショット。`ideal_score`（コサイン類似度）と `realistic_score`（tech_level_scoreで割引いた合格可能性）を分けて格納する。
 
 ---
 
@@ -201,6 +198,9 @@ client.create(model="claude-3", messages=[...])
 ```bash
 # Anthropic API
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Google Gemini API（企業情報ウェブ検索用）
+GEMINI_API_KEY=AIza...
 
 # Database
 DATABASE_URL=postgresql://gradmatch:gradmatch_dev@localhost:5432/gradmatch
@@ -214,15 +214,20 @@ LOG_LEVEL=INFO
 
 ---
 
-## 進捗状況（最終更新: 2026-05-14）
+## 進捗状況（最終更新: 2026-05-27）
 
-- [x] 計画書作成
-- [x] データモデル設計
-- [x] **Step 0: 企業マスタ初期構築（完了）**
-- [ ] Step 1: ユーザープロフィール画面
-- [ ] Step 2: スコアリングエンジン
-- [ ] Step 3: 逆引き推薦
-- [ ] Step 4: 企業追加・補強
+### V1（完了）
+- [x] 計画書作成・データモデル設計
+- [x] **Step 0: 企業マスタ初期構築（Gemini + Anthropic + OpenWork/Green）**
+- [x] Streamlit UI（5軸加重和スコアリング）
+
+### V2（現在進行中）
+- [x] **Phase 0: CLAUDE.md・V2計画書更新**
+- [ ] **Phase 1**: DBスキーマ拡張（CompanyDimensions / CompanyVector / UserProfile / MatchResult + pgvector）
+- [ ] **Phase 2**: ディメンション抽出パイプライン（Gemini検索 + Haiku構造化抽出 + 正確性検証）
+- [ ] **Phase 3**: ユーザープロフィール DB移行 + 対話型ウィザードUI
+- [ ] **Phase 4**: マッチングエンジン（コサイン類似度 + 理想/現実的ランキング分離）
+- [ ] **Phase 5**: データ充実・チューニング（カバレッジ70%達成）
 
 ---
 
@@ -230,11 +235,12 @@ LOG_LEVEL=INFO
 
 新しい機能を実装する前に、以下を確認：
 
-1. [ ] この機能はどのStepに属するか？スコープ外を勝手に実装していないか？
+1. [ ] この機能はどのV2フェーズに属するか？スコープ外を勝手に実装していないか？
 2. [ ] 既存の `models.py` のテーブルで足りるか？新規追加が必要か？
-3. [ ] LLMを使う場合、Sonnet/Haikuのどちらが適切か？
+3. [ ] LLMを使う場合、Gemini（検索）/ Haiku（抽出）/ Sonnet（推論）のどれが適切か？
 4. [ ] エラーハンドリングは ProcessingLog に記録されるか？
 5. [ ] 単体テストは書けるか？外部API依存はmockできるか？
+6. [ ] LLM抽出値には証拠テキストを添えているか（正確性検証のため）？
 
 ---
 
