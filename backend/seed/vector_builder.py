@@ -19,6 +19,7 @@ import logging
 import uuid
 
 import sqlalchemy as sa
+from sqlalchemy.orm import selectinload
 
 from backend.database import get_session
 from backend.models import Company, CompanyDimensions, CompanyMetrics, CompanyVector
@@ -165,15 +166,23 @@ def _upsert_vector(company_id: uuid.UUID, scores: list[float]) -> None:
 def build_all_vectors() -> None:
     """全企業の CompanyVector を算術計算してupsertする。"""
     with get_session() as session:
-        companies: list[Company] = session.execute(sa.select(Company)).scalars().all()
-
-    logger.info("ベクトル計算開始: %d社", len(companies))
-    for i, company in enumerate(companies, 1):
-        dims = company.dimensions
-        metrics = company.metrics
-        scores = build_vector(company, dims, metrics)
-        _upsert_vector(company.id, scores)
-        logger.debug("[%d] %s → %s", i, company.name, scores)
+        companies: list[Company] = (
+            session.execute(
+                sa.select(Company).options(
+                    selectinload(Company.dimensions),
+                    selectinload(Company.metrics),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        logger.info("ベクトル計算開始: %d社", len(companies))
+        for i, company in enumerate(companies, 1):
+            dims = company.dimensions
+            metrics = company.metrics
+            scores = build_vector(company, dims, metrics)
+            _upsert_vector(company.id, scores)
+            logger.debug("[%d] %s → %s", i, company.name, scores)
 
     logger.info("ベクトル計算完了: %d社", len(companies))
     print(f"[Phase 3d] {len(companies)}社のベクトル計算完了")

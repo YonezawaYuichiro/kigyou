@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.orm import selectinload
 
 from backend.api.scorer import _passes_hard_filters
 from backend.database import get_session
@@ -30,21 +31,24 @@ def _build_filter_set(hard_constraints: dict[str, Any]) -> set[str]:
     remote_ok = hard_constraints.get("remote_work", [])
     prefectures = hard_constraints.get("preferred_prefectures", [])
 
-    with get_session() as session:
-        companies = session.execute(sa.select(Company)).scalars().all()
-
     passed: set[str] = set()
-    for company in companies:
-        m = company.metrics
-        if not _passes_hard_filters(
-            m, {"max_overtime_hours": max_ot, "min_openwork_score": min_score}
-        ):
-            continue
-        if remote_ok and m and m.remote_work_policy and m.remote_work_policy not in remote_ok:
-            continue
-        if prefectures and company.hq_prefecture not in prefectures:
-            continue
-        passed.add(str(company.id))
+    with get_session() as session:
+        companies = (
+            session.execute(sa.select(Company).options(selectinload(Company.metrics)))
+            .scalars()
+            .all()
+        )
+        for company in companies:
+            m = company.metrics
+            if not _passes_hard_filters(
+                m, {"max_overtime_hours": max_ot, "min_openwork_score": min_score}
+            ):
+                continue
+            if remote_ok and m and m.remote_work_policy and m.remote_work_policy not in remote_ok:
+                continue
+            if prefectures and company.hq_prefecture not in prefectures:
+                continue
+            passed.add(str(company.id))
     return passed
 
 
@@ -58,7 +62,7 @@ def _query_cosine_matches(weights: list[float], filtered_ids: set[str]) -> list[
         SELECT
             cv.company_id::text AS company_id,
             1 - (cv.dim_scores <=> :vec ::vector) AS ideal_score,
-            (cv.dim_scores)[10] AS tech_demand_raw
+            (cv.dim_scores::real[])[10] AS tech_demand_raw
         FROM company_vector cv
         WHERE cv.company_id::text = ANY(:ids)
           AND cv.dim_scores IS NOT NULL
@@ -95,50 +99,51 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
         return []
 
     ids = [m["company_id"] for m in matches]
+    enriched: list[dict[str, Any]] = []
     with get_session() as session:
         companies = {
             str(c.id): c
             for c in session.execute(
-                sa.select(Company).where(sa.cast(Company.id, sa.String).in_(ids))
+                sa.select(Company)
+                .options(selectinload(Company.metrics), selectinload(Company.dimensions))
+                .where(sa.cast(Company.id, sa.String).in_(ids))
             )
             .scalars()
             .all()
         }
-
-    enriched: list[dict[str, Any]] = []
-    for m in matches:
-        company = companies.get(m["company_id"])
-        if not company:
-            continue
-        metrics: CompanyMetrics | None = company.metrics
-        dims: CompanyDimensions | None = company.dimensions
-        realistic = _compute_realistic(m["ideal_score"], m["tech_demand"], tech_level)
-        enriched.append(
-            {
-                "company_id": m["company_id"],
-                "name": company.name,
-                "official_url": company.official_url,
-                "hq_prefecture": company.hq_prefecture,
-                "estimated_category": company.estimated_category,
-                "tech_stack": list(company.tech_stack or []),
-                "ideal_score": round(m["ideal_score"], 4),
-                "realistic_score": realistic,
-                # CompanyMetrics
-                "openwork_score": metrics.openwork_score if metrics else None,
-                "avg_overtime_hours": metrics.avg_overtime_hours if metrics else None,
-                "avg_annual_salary": metrics.avg_annual_salary if metrics else None,
-                "employee_count": metrics.employee_count if metrics else None,
-                "remote_work_policy": metrics.remote_work_policy if metrics else None,
-                "openwork_url": metrics.openwork_url if metrics else None,
-                "green_url": metrics.green_url if metrics else None,
-                # CompanyDimensions
-                "overall_confidence": dims.overall_confidence if dims else None,
-                "tech_env_evidence": dims.tech_env_evidence if dims else None,
-                "psychological_safety_score": dims.psychological_safety_score if dims else None,
-                "junior_authority_score": dims.junior_authority_score if dims else None,
-                "has_coding_test": dims.has_coding_test if dims else None,
-            }
-        )
+        for m in matches:
+            company = companies.get(m["company_id"])
+            if not company:
+                continue
+            metrics: CompanyMetrics | None = company.metrics
+            dims: CompanyDimensions | None = company.dimensions
+            realistic = _compute_realistic(m["ideal_score"], m["tech_demand"], tech_level)
+            enriched.append(
+                {
+                    "company_id": m["company_id"],
+                    "name": company.name,
+                    "official_url": company.official_url,
+                    "hq_prefecture": company.hq_prefecture,
+                    "estimated_category": company.estimated_category,
+                    "tech_stack": list(company.tech_stack or []),
+                    "ideal_score": round(m["ideal_score"], 4),
+                    "realistic_score": realistic,
+                    # CompanyMetrics
+                    "openwork_score": metrics.openwork_score if metrics else None,
+                    "avg_overtime_hours": metrics.avg_overtime_hours if metrics else None,
+                    "avg_annual_salary": metrics.avg_annual_salary if metrics else None,
+                    "employee_count": metrics.employee_count if metrics else None,
+                    "remote_work_policy": metrics.remote_work_policy if metrics else None,
+                    "openwork_url": metrics.openwork_url if metrics else None,
+                    "green_url": metrics.green_url if metrics else None,
+                    # CompanyDimensions
+                    "overall_confidence": dims.overall_confidence if dims else None,
+                    "tech_env_evidence": dims.tech_env_evidence if dims else None,
+                    "psychological_safety_score": dims.psychological_safety_score if dims else None,
+                    "junior_authority_score": dims.junior_authority_score if dims else None,
+                    "has_coding_test": dims.has_coding_test if dims else None,
+                }
+            )
     return enriched
 
 

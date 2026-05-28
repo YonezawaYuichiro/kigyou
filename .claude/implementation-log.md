@@ -246,3 +246,52 @@
   - Docker pgvector イメージへの切り替え後、既存 `postgres_data` volume との互換性確認が必要（`pg_dump` でバックアップ推奨）
   - Phase 3c/3d の実際の実行（`python -m backend.seed.dimensions_extractor`）は Gemini API キー設定後に実施
   - Phase 5: カバレッジ測定（★項目70%以上埋まりを目標）、tech_level_score キャリブレーション
+
+---
+
+## 2026-05-28: dimensions_extractor 並列化 + 全341社抽出完了 + V2 UI動作確認
+
+- **実装内容**:
+  - `backend/seed/dimensions_extractor.py` — ThreadPoolExecutor + Semaphore で並列化。`_GEMINI_SEMAPHORE(10)` / `_HAIKU_SEMAPHORE(2)` / `_thread_local` でスレッドセーフ化。`_search_category` は3クエリ並列化、`_process_single_company` で10カテゴリ並列化、`extract_all_companies` で3社並列化。`done_ids` で処理済みスキップ（冪等）
+  - `backend/seed/vector_builder.py` — `selectinload` + セッション内処理で `DetachedInstanceError` 修正
+  - `backend/api/matching_engine.py` — `_build_filter_set` / `_enrich_results` を `selectinload` + セッション内処理で `DetachedInstanceError` 修正。pgvector のサブスクリプト構文を `dim_scores::real[])[10]` に修正
+
+- **設計判断**:
+  - 直列処理（39時間見込み）→ 並列化で約2時間に短縮
+  - Haiku セマフォ: 5→2（Anthropic 50 RPM 制限に対応）
+  - `done_ids` は `overall_confidence >= 0.4` のみスキップ。低信頼度社は再実行対象にする設計
+  - pgvector は `float4` 型のため `::float[]` キャストは不可。`::real[]` が正解
+
+- **動作確認**:
+  - 全341社のディメンション抽出完了（confidence≥0.4: 196社 = 57.5%）
+  - CompanyVector 341社生成完了
+  - Streamlit UI（http://localhost:8501）で理想企業ランキング50社表示確認
+
+- **残課題**:
+  - CompanyMetrics: 96/341社のみ（OW・年収・残業がNone多数）→ `update_metrics.py` 実行中
+  - Anthropic 月額上限に達したため confidence<0.4の145社は6/1リセット後に再実行
+  - Gemini月額上限（¥5,000）超過 → ¥20,000に引き上げ済み
+
+---
+
+## 2026-05-28: V2完了・データ充実（Phase 5）
+
+- **実装内容**:
+  - `update_metrics.py` 実行 — 245社のOpenWork/Greenスクレイピング。CompanyMetrics: 96社→160社
+  - dimensions_extractor 再実行（低信頼度145社）— confidence≥0.4: 196社→215社（63%）
+  - `vector_builder.py` 再実行 — CompanyMetrics充実後のベクトルを再計算
+
+- **設計判断**:
+  - confidence の構造的上限は約0.88（財務情報が非公開の企業は財務カテゴリが恒常的に低い）
+  - OWスコアの7%カバレッジは構造的限界（未登録企業が大半）
+  - これ以上の信頼度改善は新規データソース追加（V3でWantedly/Zenn/Qiita追加）で対応
+
+- **動作確認**:
+  - confidence≥0.4: 215社（63%）、平均0.458
+  - CompanyMetrics: 160社（OWスコアあり24社・Green URLあり140社）
+  - Streamlit V2 UI 正常動作確認
+
+- **残課題（V3へ移行）**:
+  - ユーザープロフィールの★項目未実装（志望業界・職種・MBTI・希望年収等）→ V3 Phase 1
+  - 企業情報閲覧ページなし → V3 Phase 2
+  - XAI（マッチング理由説明）なし → V3 Phase 3

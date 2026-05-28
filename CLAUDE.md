@@ -223,11 +223,11 @@ LOG_LEVEL=INFO
 
 ### V2（現在進行中）
 - [x] **Phase 0: CLAUDE.md・V2計画書更新**
-- [ ] **Phase 1**: DBスキーマ拡張（CompanyDimensions / CompanyVector / UserProfile / MatchResult + pgvector）
-- [ ] **Phase 2**: ディメンション抽出パイプライン（Gemini検索 + Haiku構造化抽出 + 正確性検証）
-- [ ] **Phase 3**: ユーザープロフィール DB移行 + 対話型ウィザードUI
-- [ ] **Phase 4**: マッチングエンジン（コサイン類似度 + 理想/現実的ランキング分離）
-- [ ] **Phase 5**: データ充実・チューニング（カバレッジ70%達成）
+- [x] **Phase 1**: DBスキーマ拡張（CompanyDimensions / CompanyVector / UserProfile / MatchResult + pgvector）
+- [x] **Phase 2**: ディメンション抽出パイプライン（Gemini検索 + Haiku構造化抽出）341社完了
+- [x] **Phase 3**: UserProfile DB移行 + profile_setup ウィザードUI（pages/1_profile_setup.py）
+- [x] **Phase 4**: マッチングエンジン（pgvectorコサイン類似度 + 理想/現実ランキング分離）
+- [ ] **Phase 5**: データ充実（CompanyMetrics 96/341社 → 目標70%以上、confidence≥0.4: 57.5% → 70%）
 
 ---
 
