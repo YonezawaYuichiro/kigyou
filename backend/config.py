@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     # LLM モデル名
     sonnet_model: str = "claude-sonnet-4-6"
     haiku_model: str = "claude-haiku-4-5"
-    gemini_model: str = "gemini-2.5-flash"
+    # Gemini: 2.5-flash はthinkingモードで高額になりやすい
+    # 2.0-flash: $0.075/1M input, $0.30/1M output（グラウンディング検索対応）
+    # 2.0-flash-lite: $0.0375/1M input, $0.15/1M output（さらに安い・検索対応）
+    gemini_model: str = "gemini-2.0-flash"
 
     # Gemini API キー（空の場合は Claude のみ使用）
     gemini_api_key: str = Field(default="", description="Gemini API キー")
