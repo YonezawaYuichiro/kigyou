@@ -1,0 +1,82 @@
+[
+  {
+    "name_contains": "サイボウズ",
+    "expected": {
+      "high": [0, 4, 5, 9],
+      "low": [],
+      "notes": "自社開発kintone/Garoon、カルチャー重視で有名（100人100通り人事）、技術ブログ活発"
+    }
+  },
+  {
+    "name_contains": "freee",
+    "expected": {
+      "high": [0, 1, 9],
+      "low": [],
+      "notes": "SaaS会計・HR自社開発、新規事業積極、エンジニア採用力高い"
+    }
+  },
+  {
+    "name_contains": "NTTデータ",
+    "expected": {
+      "high": [3],
+      "low": [0, 1],
+      "notes": "大規模SIer、上場・安定性は最高だが受託中心"
+    }
+  },
+  {
+    "name_contains": "楽天",
+    "expected": {
+      "high": [0, 1, 3],
+      "low": [7],
+      "notes": "自社サービス多数・新規事業積極・大企業、残業多いで知られる"
+    }
+  },
+  {
+    "name_contains": "パナソニック",
+    "expected": {
+      "high": [3],
+      "low": [0, 1, 9],
+      "notes": "大企業・上場・老舗、IT事業はレガシーシステムも多い、自社開発度は低め"
+    }
+  },
+  {
+    "name_contains": "LINE",
+    "expected": {
+      "high": [0, 1, 9],
+      "low": [],
+      "notes": "自社開発SNS・AI研究、技術力高い、開発環境モダン"
+    }
+  },
+  {
+    "name_contains": "メルカリ",
+    "expected": {
+      "high": [0, 1, 6, 9],
+      "low": [],
+      "notes": "自社プロダクト、若手エンジニアに裁量あり、技術ブログ活発"
+    }
+  },
+  {
+    "name_contains": "富士通",
+    "expected": {
+      "high": [3],
+      "low": [0, 9],
+      "notes": "大手SIer・老舗・上場、レガシーシステムも多く開発環境はモダンでない場合がある"
+    }
+  },
+  {
+    "name_contains": "Sansan",
+    "expected": {
+      "high": [0, 1, 4, 9],
+      "low": [],
+      "notes": "名刺管理SaaS自社開発、エンジニア育成投資大、技術力高い"
+    }
+  },
+  {
+    "name_contains": "SmartHR",
+    "expected": {
+      "high": [0, 1, 5, 9],
+      "low": [],
+      "notes": "HR SaaS自社開発、カルチャー重視、エンジニア主導文化"
+    }
+  }
+]
