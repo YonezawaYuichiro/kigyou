@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import selectinload
 
 from backend.database import get_session
-from backend.models import Company, CompanyDimensions, CompanyMetrics, CompanyVector
+from backend.models import Company
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,8 @@ _HIGH_THRESHOLD = 0.55
 _LOW_THRESHOLD = 0.45
 
 
-def _load_all_companies() -> list[
-    tuple[Company, CompanyDimensions | None, CompanyMetrics | None, CompanyVector | None]
-]:
-    """全企業とDimensions/Metrics/Vectorを一括取得する。"""
+def _load_all_companies() -> list[dict]:
+    """全企業データをセッション内でdictに変換して返す（DetachedInstanceError回避）。"""
     with get_session() as session:
         companies = (
             session.execute(
@@ -62,7 +60,31 @@ def _load_all_companies() -> list[
             .scalars()
             .all()
         )
-        return [(c, c.dimensions, c.metrics, c.vector) for c in companies]
+        rows = []
+        for c in companies:
+            d = c.dimensions
+            m = c.metrics
+            v = c.vector
+            rows.append(
+                {
+                    # Company
+                    "name": c.name,
+                    "estimated_category": c.estimated_category,
+                    # CompanyDimensions
+                    "psychological_safety_score": d.psychological_safety_score if d else None,
+                    "junior_authority_score": d.junior_authority_score if d else None,
+                    "skill_support_score": d.skill_support_score if d else None,
+                    "overall_confidence": d.overall_confidence if d else None,
+                    # CompanyMetrics
+                    "ow_score_morale": m.ow_score_morale if m else None,
+                    "ow_score_openness": m.ow_score_openness if m else None,
+                    "ow_score_growth": m.ow_score_growth if m else None,
+                    "ow_score_treatment": m.ow_score_treatment if m else None,
+                    # CompanyVector
+                    "dim_scores": list(v.dim_scores) if v and v.dim_scores is not None else None,
+                }
+            )
+        return rows
 
 
 def load_benchmark() -> list[dict]:
@@ -78,9 +100,7 @@ def load_benchmark() -> list[dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def check_llm_vs_openwork_correlation(
-    rows: list[tuple],
-) -> dict[str, dict]:
+def check_llm_vs_openwork_correlation(rows: list[dict]) -> dict[str, dict]:
     """LLM抽出スコア vs OpenWorkサブスコアのSpearman相関を計算する。
 
     検証する対応:
@@ -90,31 +110,26 @@ def check_llm_vs_openwork_correlation(
     """
     results: dict[str, dict] = {}
 
-    # dim[5] カルチャー vs OpenWork文化系スコア
     pairs_culture = [
-        (dims.psychological_safety_score, (m.ow_score_morale + m.ow_score_openness) / 2)
-        for _, dims, m, _ in rows
-        if dims
-        and m
-        and dims.psychological_safety_score is not None
-        and m.ow_score_morale is not None
-        and m.ow_score_openness is not None
+        (r["psychological_safety_score"], (r["ow_score_morale"] + r["ow_score_openness"]) / 2)
+        for r in rows
+        if r["psychological_safety_score"] is not None
+        and r["ow_score_morale"] is not None
+        and r["ow_score_openness"] is not None
     ]
     results["dim5_culture"] = _spearman(pairs_culture, "心理的安全性 vs OW文化スコア")
 
-    # dim[6] キャリア vs ow_score_growth
     pairs_career = [
-        (dims.junior_authority_score, m.ow_score_growth)
-        for _, dims, m, _ in rows
-        if dims and m and dims.junior_authority_score is not None and m.ow_score_growth is not None
+        (r["junior_authority_score"], r["ow_score_growth"])
+        for r in rows
+        if r["junior_authority_score"] is not None and r["ow_score_growth"] is not None
     ]
     results["dim6_career"] = _spearman(pairs_career, "若手裁量スコア vs OW成長性スコア")
 
-    # dim[4] 育成支援 vs ow_score_treatment
     pairs_growth = [
-        (dims.skill_support_score, m.ow_score_treatment)
-        for _, dims, m, _ in rows
-        if dims and m and dims.skill_support_score is not None and m.ow_score_treatment is not None
+        (r["skill_support_score"], r["ow_score_treatment"])
+        for r in rows
+        if r["skill_support_score"] is not None and r["ow_score_treatment"] is not None
     ]
     results["dim4_growth"] = _spearman(pairs_growth, "スキル支援スコア vs OW待遇スコア")
 
@@ -141,22 +156,21 @@ def _spearman(pairs: list[tuple[float, float]], label: str) -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def check_data_coverage(rows: list[tuple]) -> list[dict]:
+def check_data_coverage(rows: list[dict]) -> list[dict]:
     """各次元のデータカバレッジ率（スコアがNoneでない企業の割合）を計算する。"""
     total = len(rows)
     if total == 0:
         return []
 
-    # CompanyVector から各次元のスコアを取得
     coverage: list[int] = [0] * 10
-    for _, _, _, vec in rows:
-        if vec and vec.dim_scores is not None:
-            scores = list(vec.dim_scores)
+    for r in rows:
+        scores = r.get("dim_scores")
+        if scores:
             for i, s in enumerate(scores[:10]):
                 if s is not None:
                     coverage[i] += 1
 
-    vec_count = sum(1 for _, _, _, vec in rows if vec and vec.dim_scores is not None)
+    vec_count = sum(1 for r in rows if r.get("dim_scores"))
     return [
         {
             "dim": i,
@@ -169,14 +183,14 @@ def check_data_coverage(rows: list[tuple]) -> list[dict]:
     ]
 
 
-def analyze_score_distribution(rows: list[tuple]) -> list[dict]:
+def analyze_score_distribution(rows: list[dict]) -> list[dict]:
     """各次元のスコア分布統計（mean, std, min, max）を計算する。"""
     import statistics
 
     dim_scores: list[list[float]] = [[] for _ in range(10)]
-    for _, _, _, vec in rows:
-        if vec and vec.dim_scores is not None:
-            scores = list(vec.dim_scores)
+    for r in rows:
+        scores = r.get("dim_scores")
+        if scores:
             for i, s in enumerate(scores[:10]):
                 if s is not None:
                     dim_scores[i].append(float(s))
@@ -202,7 +216,7 @@ def analyze_score_distribution(rows: list[tuple]) -> list[dict]:
     return result
 
 
-def check_category_discrimination(rows: list[tuple]) -> dict[str, dict]:
+def check_category_discrimination(rows: list[dict]) -> dict[str, dict]:
     """estimated_categoryごとの各次元平均スコアを計算する。
 
     期待パターン:
@@ -213,12 +227,12 @@ def check_category_discrimination(rows: list[tuple]) -> dict[str, dict]:
 
     category_scores: dict[str, list[list[float]]] = {}
 
-    for company, _, _, vec in rows:
-        cat = company.estimated_category
+    for r in rows:
+        cat = r["estimated_category"]
         if cat not in category_scores:
             category_scores[cat] = [[] for _ in range(10)]
-        if vec and vec.dim_scores is not None:
-            scores = list(vec.dim_scores)
+        scores = r.get("dim_scores")
+        if scores:
             for i, s in enumerate(scores[:10]):
                 if s is not None:
                     category_scores[cat][i].append(float(s))
@@ -226,22 +240,22 @@ def check_category_discrimination(rows: list[tuple]) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for cat, dim_lists in category_scores.items():
         result[cat] = {
-            "n": sum(1 for company, _, _, vec in rows if company.estimated_category == cat and vec),
+            "n": sum(1 for r in rows if r["estimated_category"] == cat and r.get("dim_scores")),
             "dim_means": [
                 round(statistics.mean(lst), 3) if len(lst) >= 2 else None for lst in dim_lists
             ],
         }
 
-    # サニティチェック: dim[0]で 自社開発 > SIer か
     dim0_checks = {}
     for cat in ["自社開発", "SIer", "スタートアップ"]:
         if cat in result and result[cat]["dim_means"][0] is not None:
             dim0_checks[cat] = result[cat]["dim_means"][0]
 
-    category_ok = False
-    if "自社開発" in dim0_checks and "SIer" in dim0_checks:
-        category_ok = dim0_checks["自社開発"] > dim0_checks["SIer"]
-
+    category_ok = (
+        "自社開発" in dim0_checks
+        and "SIer" in dim0_checks
+        and dim0_checks["自社開発"] > dim0_checks["SIer"]
+    )
     result["_sanity_dim0"] = {
         "values": dim0_checks,
         "status": "✅ 自社開発 > SIer" if category_ok else "⚠️ 期待パターン不一致",
@@ -254,16 +268,13 @@ def check_category_discrimination(rows: list[tuple]) -> dict[str, dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def check_benchmark(rows: list[tuple], benchmark: list[dict]) -> dict:
+def check_benchmark(rows: list[dict], benchmark: list[dict]) -> dict:
     """期待スコアと実際のスコアの一致率を計算する。"""
     passed = 0
     total = 0
     details = []
 
-    # 企業名 → (Company, vec) のマッピング
-    company_map = {
-        company.name: vec for company, _, _, vec in rows if vec and vec.dim_scores is not None
-    }
+    company_map = {r["name"]: r["dim_scores"] for r in rows if r.get("dim_scores")}
 
     for entry in benchmark:
         name_contains = entry["name_contains"]
@@ -272,7 +283,7 @@ def check_benchmark(rows: list[tuple], benchmark: list[dict]) -> dict:
             details.append({"name": name_contains, "status": "⚪ DBに未登録"})
             continue
 
-        scores = list(company_map[matched_name].dim_scores)
+        scores = list(company_map[matched_name])
         item_results = []
 
         for high_dim in entry["expected"]["high"]:
@@ -397,6 +408,9 @@ def _print_report(report: dict) -> None:
 
 if __name__ == "__main__":
     import logging as _logging
+    import sys
+
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 
     from backend.config import settings
 
