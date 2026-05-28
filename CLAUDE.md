@@ -214,20 +214,24 @@ LOG_LEVEL=INFO
 
 ---
 
-## 進捗状況（最終更新: 2026-05-27）
+## 進捗状況（最終更新: 2026-05-28）
 
 ### V1（完了）
 - [x] 計画書作成・データモデル設計
 - [x] **Step 0: 企業マスタ初期構築（Gemini + Anthropic + OpenWork/Green）**
 - [x] Streamlit UI（5軸加重和スコアリング）
 
-### V2（現在進行中）
-- [x] **Phase 0: CLAUDE.md・V2計画書更新**
-- [x] **Phase 1**: DBスキーマ拡張（CompanyDimensions / CompanyVector / UserProfile / MatchResult + pgvector）
-- [x] **Phase 2**: ディメンション抽出パイプライン（Gemini検索 + Haiku構造化抽出）341社完了
-- [x] **Phase 3**: UserProfile DB移行 + profile_setup ウィザードUI（pages/1_profile_setup.py）
-- [x] **Phase 4**: マッチングエンジン（pgvectorコサイン類似度 + 理想/現実ランキング分離）
-- [ ] **Phase 5**: データ充実（CompanyMetrics 96/341社 → 目標70%以上、confidence≥0.4: 57.5% → 70%）
+### V2（完了）
+- [x] **Phase 0-4**: DBスキーマ / ディメンション抽出 / UserProfile / マッチングエンジン
+- [x] **Phase 5**: データ充実（confidence≥0.4: 63%達成）
+
+### V3（完了）
+- [x] **Phase 1**: UserProfile★項目追加（9カラム）+ 4ステップウィザード + 市場ポジション可視化
+- [x] **Phase 2**: 企業情報閲覧ページ（pages/2_company_explorer.py）
+- [x] **Phase 3**: XAI（マッチング説明・10次元比較チャート・貢献度TOP3）
+- [x] **Phase 4**: 意図翻訳エンジン（自然言語→10次元重みベクトル、Sonnet 4.6）
+- [x] **Phase 5**: GitHub解析（公開リポジトリ解析でtech_level精度向上）
+- [x] **Phase 6**: FastAPI化（5エンドポイント、Swagger UI対応）
 
 ---
 

@@ -2,6 +2,25 @@
 
 ---
 
+## 2026-05-28: V3 Phase 6 — FastAPI化
+
+- **実装内容**:
+  - `backend/api/schemas.py` — Pydantic v2 リクエスト/レスポンス型 （ProfileRequest / ProfileResponse / CompanyListItem / CompanyListResponse / CompanyDimensionsSchema / CompanyDetailResponse / MatchItem / MatchResponse）
+  - `backend/api/routes.py` — FastAPI APIRouter。5エンドポイント実装（health / profile / matches / companies / companies/{id}）
+  - `backend/main.py` — FastAPIアプリ本体。CORSMiddleware（localhost:8501）+ ルーターマウント
+  - `pyproject.toml` — fastapi>=0.115.0 / uvicorn[standard]>=0.32.0 を dependencies に追加
+
+- **設計判断**:
+  - Streamlit側のリファクタ（requestsでAPIを叩く移行）は「段階的」とし今回は行わない。FastAPI側だけ整備して将来の移行に備える
+  - `GET /api/v2/companies` は全件取得後Python側でフィルタリング（pgvectorの型制約のためSQL側での絞り込みが難しい項目があるため）
+  - セッションIDはクエリパラメータで受け取る（ヘッダーだとSwagger UIでのテストが面倒なため）
+
+- **動作確認**: ruff ALL PASS、pytest 26 passed、`from backend.main import app` でルート5件確認
+
+- **残課題**: なし（V3全Phase完了）
+
+---
+
 ## 2026-05-28: V3 Phase 5 — GitHub解析
 
 - **実装内容**:
