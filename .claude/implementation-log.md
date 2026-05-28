@@ -2,6 +2,26 @@
 
 ---
 
+## 2026-05-28: V3 Phase 1 — ユーザー分析フロー完成
+
+- **実装内容**:
+  - `backend/models.py` — UserProfile に9カラム追加（graduation_year, major, target_industries, target_roles, dev_phase_preference, min_salary, mbti, eval_preference, psych_safety_importance）
+  - `alembic/versions/5b55de823f24_add_v3_user_profile_fields.py` — 新規マイグレーション、適用済み
+  - `backend/api/profile_manager.py` — `_compute_dimension_weights()` を精緻化（志望業界・職種・開発フェーズ・評価制度・心理的安全性を重みに反映）、`save_profile()` に新フィールド引数追加
+  - `pages/1_profile_setup.py` — 3ステップ→4ステップに拡張（Step 2「志望軸」を新設）
+  - `app.py` — 市場ポジション可視化を追加（`_get_all_tech_levels()` + `_render_market_position()`）
+
+- **設計判断**:
+  - `_compute_dimension_weights()` への追加フィールドはすべてオプション引数（既存プロフィールとの後方互換を保つため）
+  - `new_fields` をdictにまとめて `setattr` ループで既存レコードに適用 → フィールド追加が1箇所で完結する
+  - 市場ポジション可視化はDB内の全UserProfileとの相対比較で算出。ユーザーが1人だけの場合はスキップ（len < 2）
+
+- **動作確認**: ruff check ALL PASS、pytest 26 passed
+
+- **残課題**: V3 Phase 2（企業情報閲覧ページ）
+
+---
+
 ## 2026-05-14: Step 0 企業マスタ初期構築（全Phase）
 
 - **実装内容**:

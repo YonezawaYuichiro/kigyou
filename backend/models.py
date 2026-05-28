@@ -245,6 +245,21 @@ class UserProfile(Base):
     tech_level_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     tech_level_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # 基本情報
+    graduation_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    major: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # 志望軸
+    target_industries: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    target_roles: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    dev_phase_preference: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    min_salary: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # 価値観・性格
+    mbti: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    eval_preference: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    psych_safety_importance: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # 条件設定
     hard_constraints: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     soft_preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)

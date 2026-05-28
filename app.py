@@ -12,6 +12,7 @@ import json
 import uuid
 
 import pandas as pd
+import sqlalchemy as sa
 import streamlit as st
 from anthropic import Anthropic
 from sqlalchemy import select
@@ -21,7 +22,7 @@ from backend.api.profile_manager import load_or_create_profile
 from backend.api.scorer import calc_score, load_profile
 from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
-from backend.models import Company, CompanyMetrics
+from backend.models import Company, CompanyMetrics, UserProfile
 
 
 @st.cache_resource
@@ -225,6 +226,70 @@ def _render_v2_table(rows: list[dict], score_col: str, score_label: str) -> str 
     return rows[selected[0]]["name"] if selected else None
 
 
+@st.cache_data(ttl=300)
+def _get_all_tech_levels() -> list[float]:
+    """DB内の全UserProfileのtech_level_scoreを取得する。"""
+    with get_session() as session:
+        rows = (
+            session.execute(
+                sa.select(UserProfile.tech_level_score).where(
+                    UserProfile.tech_level_score.is_not(None)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return [float(v) for v in rows]
+
+
+def _render_market_position(tech_level: float) -> None:
+    """ユーザーの実務力スコアを全ユーザーとの相対比較で表示する。"""
+    all_levels = _get_all_tech_levels()
+    if len(all_levels) < 2:
+        return
+    below = sum(1 for v in all_levels if v < tech_level)
+    percentile = round(below / len(all_levels) * 100)
+
+    if percentile >= 80:
+        tier, color = "上位層", "🟢"
+    elif percentile >= 50:
+        tier, color = "中上位層", "🔵"
+    elif percentile >= 20:
+        tier, color = "中位層", "🟡"
+    else:
+        tier, color = "初級層", "🟠"
+
+    with st.expander(f"📊 市場ポジション: {color} {tier}（上位 {100 - percentile}%）"):
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric("あなたの実務力スコア", f"{tech_level:.2f}")
+            st.caption(f"登録ユーザー {len(all_levels)} 人中 上位 {100 - percentile}% の実務力です")
+        with col_m2:
+            # tech_level_scoreに基づく「受けるべき企業帯」の目安
+            if tech_level >= 0.7:
+                target_range = "大手/メガベンチャー・競争率の高いスタートアップ"
+            elif tech_level >= 0.5:
+                target_range = "中堅SaaS・成長期スタートアップ・SIer上位"
+            elif tech_level >= 0.3:
+                target_range = "中小規模Web・受託開発・SIer中堅"
+            else:
+                target_range = "研修充実・未経験歓迎の企業"
+            st.metric("受けるべき企業帯の目安", "")
+            st.caption(f"→ {target_range}")
+
+        scores_series = pd.Series(all_levels)
+        hist_data = (
+            pd.cut(
+                scores_series,
+                bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+            )
+            .value_counts()
+            .sort_index()
+        )
+        st.bar_chart(hist_data, height=120, x_label="実務力スコア帯", y_label="ユーザー数")
+
+
 def _render_v2_detail(name: str, rows: list[dict]) -> None:
     """V2企業詳細を描画する。"""
     detail = next((r for r in rows if r["name"] == name), None)
@@ -268,6 +333,8 @@ with tab_ideal:
     st.caption(
         f"あなたの実務力スコア: **{tech_level:.2f}** / 1.0　　[プロフィール設定](./1_profile_setup)で更新できます。"
     )
+
+    _render_market_position(tech_level)
 
     col_refresh, col_info = st.columns([1, 5])
     with col_refresh:
