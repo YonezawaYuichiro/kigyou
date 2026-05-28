@@ -2,6 +2,25 @@
 
 ---
 
+## 2026-05-28: V3 Phase 4 — 意図翻訳エンジン
+
+- **実装内容**:
+  - `backend/api/intent_translator.py` — 新規作成。`translate_intent(free_text, base_weights)` でSonnet 4.6が10次元重みに変換
+  - `backend/api/profile_manager.py` — `update_dimension_weights(session_id, weights)` を追加（dimension_weightsのみ直接上書き）
+  - `app.py` — V2「理想企業」タブに「💬 自然言語で重みを調整」expanderを追加
+
+- **設計判断**:
+  - 提案→確認→適用の3段階UI: Sonnetの提案を一旦バーチャートで見せてから「✅この重みでマッチング」で確定
+  - 適用時は `update_dimension_weights()` でDBを直接上書き（`save_profile()` を通すとdimension_weightsが再計算されてしまうため）
+  - 「✕ リセット」でintent_weightsと再計算キャッシュを両方削除してプロフィール設定に戻せる
+  - `disabled="intent_weights" not in st.session_state` で「翻訳前に適用」を防止
+
+- **動作確認**: ruff check ALL PASS、pytest 26 passed
+
+- **残課題**: V3 Phase 5（GitHub解析）
+
+---
+
 ## 2026-05-28: V3 Phase 3 — XAI（マッチング説明）
 
 - **実装内容**:

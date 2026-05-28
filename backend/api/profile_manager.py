@@ -269,3 +269,13 @@ def save_profile(
             session.flush()
             session.expunge(profile)
             return profile
+
+
+def update_dimension_weights(session_id: str, weights: list[float]) -> None:
+    """dimension_weightsのみをDBに直接上書きする。意図翻訳エンジン用。"""
+    with get_session() as session:
+        existing = session.execute(
+            sa.select(UserProfile).where(UserProfile.session_id == session_id)
+        ).scalar_one_or_none()
+        if existing:
+            existing.dimension_weights = weights

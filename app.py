@@ -17,8 +17,9 @@ import streamlit as st
 from anthropic import Anthropic
 from sqlalchemy import select
 
+from backend.api.intent_translator import translate_intent
 from backend.api.matching_engine import compute_matches
-from backend.api.profile_manager import load_or_create_profile
+from backend.api.profile_manager import load_or_create_profile, update_dimension_weights
 from backend.api.scorer import calc_score, load_profile
 from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
@@ -429,6 +430,70 @@ with tab_ideal:
     )
 
     _render_market_position(tech_level)
+
+    # ─── 意図翻訳エンジン ───────────────────────────────────────────────────
+    with st.expander("💬 自然言語で重みを調整（意図翻訳）"):
+        st.caption(
+            "理想の就職先を自由に書いてください。Sonnet 4.6 が10次元重みに変換してマッチングに反映します。"
+        )
+        intent_text = st.text_area(
+            "理想の就職先（自由記述）",
+            value=st.session_state.get("intent_text", ""),
+            height=80,
+            placeholder="例: AIを使った開発がしたい。若手でも裁量が大きく、残業が少ない会社が良い。",
+            label_visibility="collapsed",
+        )
+        col_tr, col_apply, col_clear = st.columns([2, 2, 1])
+        with col_tr:
+            translate_btn = st.button("🤖 重みを提案", key="translate_btn")
+        with col_apply:
+            apply_btn = st.button(
+                "✅ この重みでマッチング",
+                key="apply_intent",
+                disabled="intent_weights" not in st.session_state,
+            )
+        with col_clear:
+            if st.button("✕ リセット", key="clear_intent"):
+                for k in ["intent_weights", "intent_explanation", "intent_text"]:
+                    st.session_state.pop(k, None)
+                for k in [k for k in st.session_state if k.startswith("v2_")]:
+                    del st.session_state[k]
+                st.rerun()
+
+        if translate_btn and intent_text.strip():
+            base_dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
+            with st.spinner("Sonnet 4.6 が重みを計算中..."):
+                new_weights, explanation = translate_intent(intent_text, base_dw)
+            st.session_state["intent_weights"] = new_weights
+            st.session_state["intent_explanation"] = explanation
+            st.session_state["intent_text"] = intent_text
+
+        if "intent_weights" in st.session_state:
+            _DIM_LABELS_SHORT = [
+                "立地",
+                "ビジョン",
+                "BM",
+                "財務",
+                "トレンド",
+                "カルチャー",
+                "キャリア",
+                "WLB",
+                "採用",
+                "開発環境",
+            ]
+            iw = st.session_state["intent_weights"]
+            iw_df = pd.DataFrame({"提案重み": iw}, index=_DIM_LABELS_SHORT)
+            st.bar_chart(iw_df, horizontal=True, height=200)
+            if st.session_state.get("intent_explanation"):
+                st.caption(f"Sonnetの解釈: {st.session_state['intent_explanation']}")
+
+        if apply_btn and "intent_weights" in st.session_state:
+            with st.spinner("プロフィールに適用中..."):
+                update_dimension_weights(_session_id, st.session_state["intent_weights"])
+            for k in [k for k in st.session_state if k.startswith("v2_")]:
+                del st.session_state[k]
+            st.success("重みを適用しました。マッチングを再実行します。")
+            st.rerun()
 
     col_refresh, col_info = st.columns([1, 5])
     with col_refresh:
