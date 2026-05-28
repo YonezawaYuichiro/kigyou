@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.api.scorer import _passes_hard_filters
 from backend.database import get_session
-from backend.models import Company, CompanyDimensions, CompanyMetrics, UserProfile
+from backend.models import Company, CompanyDimensions, CompanyMetrics, CompanyVector, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,11 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
             str(c.id): c
             for c in session.execute(
                 sa.select(Company)
-                .options(selectinload(Company.metrics), selectinload(Company.dimensions))
+                .options(
+                    selectinload(Company.metrics),
+                    selectinload(Company.dimensions),
+                    selectinload(Company.vector),
+                )
                 .where(sa.cast(Company.id, sa.String).in_(ids))
             )
             .scalars()
@@ -117,6 +121,7 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
                 continue
             metrics: CompanyMetrics | None = company.metrics
             dims: CompanyDimensions | None = company.dimensions
+            vec: CompanyVector | None = company.vector
             realistic = _compute_realistic(m["ideal_score"], m["tech_demand"], tech_level)
             enriched.append(
                 {
@@ -128,6 +133,7 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
                     "tech_stack": list(company.tech_stack or []),
                     "ideal_score": round(m["ideal_score"], 4),
                     "realistic_score": realistic,
+                    "tech_demand": m["tech_demand"],
                     # CompanyMetrics
                     "openwork_score": metrics.openwork_score if metrics else None,
                     "avg_overtime_hours": metrics.avg_overtime_hours if metrics else None,
@@ -140,8 +146,15 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
                     "overall_confidence": dims.overall_confidence if dims else None,
                     "tech_env_evidence": dims.tech_env_evidence if dims else None,
                     "psychological_safety_score": dims.psychological_safety_score if dims else None,
+                    "psychological_safety_evidence": (
+                        dims.psychological_safety_evidence if dims else None
+                    ),
                     "junior_authority_score": dims.junior_authority_score if dims else None,
+                    "junior_authority_evidence": (dims.junior_authority_evidence if dims else None),
+                    "new_biz_policy_evidence": dims.new_biz_policy_evidence if dims else None,
                     "has_coding_test": dims.has_coding_test if dims else None,
+                    # CompanyVector: 10次元スコア
+                    "dim_scores": list(vec.dim_scores) if vec and vec.dim_scores else None,
                 }
             )
     return enriched
@@ -180,4 +193,4 @@ def compute_matches(user_profile: UserProfile) -> dict[str, list[dict[str, Any]]
     for i, r in enumerate(realistic, 1):
         r["rank_realistic"] = i
 
-    return {"ideal": ideal, "realistic": realistic}
+    return {"ideal": ideal, "realistic": realistic, "dimension_weights": weights}

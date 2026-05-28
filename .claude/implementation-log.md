@@ -2,6 +2,24 @@
 
 ---
 
+## 2026-05-28: V3 Phase 3 — XAI（マッチング説明）
+
+- **実装内容**:
+  - `backend/api/matching_engine.py` — `_enrich_results()` に dim_scores (CompanyVector) + 3種の証拠テキスト (psychological_safety_evidence / junior_authority_evidence / new_biz_policy_evidence) / tech_demand を追加。`compute_matches()` が `dimension_weights` も返すよう変更
+  - `app.py` — `_render_xai_panel()` 新規追加（スコア差分3列・企業スコアvsユーザー重み比較チャート・貢献度トップ3次元expander）。`_render_v2_detail()` を改修してXAIパネル埋め込み。`_run_v2_matches()` で `v2_dimension_weights` をsession_stateにキャッシュ
+
+- **設計判断**:
+  - `contributions[i] = dim_scores[i] × dimension_weights[i]` の降順で「なぜこの企業か」を説明。コサイン類似度の内積分解と対応
+  - ideal vs realistic の差分 (`gap`) が 0.05 未満なら「技術ギャップなし」と表示し、不安を与えない
+  - 4次元のみ証拠テキストあり（ビジョン/カルチャー/キャリア/開発環境）。それ以外はキャプション補足
+  - plotly未導入のため radar chart → st.bar_chart 横棒グラフ（2系列比較）で代替
+
+- **動作確認**: ruff check ALL PASS、pytest 26 passed
+
+- **残課題**: V3 Phase 4（意図翻訳エンジン）
+
+---
+
 ## 2026-05-28: V3 Phase 2 — 企業情報閲覧ページ
 
 - **実装内容**:

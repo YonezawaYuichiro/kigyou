@@ -183,8 +183,10 @@ def _run_v2_matches() -> dict:
     if "v2_matches" not in st.session_state:
         with st.spinner("ベクトルマッチング実行中..."):
             user_profile = load_or_create_profile(_session_id)
-            st.session_state["v2_matches"] = compute_matches(user_profile)
+            result = compute_matches(user_profile)
+            st.session_state["v2_matches"] = result
             st.session_state["v2_tech_level"] = user_profile.tech_level_score or 0.5
+            st.session_state["v2_dimension_weights"] = result.get("dimension_weights", [0.1] * 10)
     return st.session_state["v2_matches"]
 
 
@@ -290,7 +292,93 @@ def _render_market_position(tech_level: float) -> None:
         st.bar_chart(hist_data, height=120, x_label="実務力スコア帯", y_label="ユーザー数")
 
 
-def _render_v2_detail(name: str, rows: list[dict]) -> None:
+_DIM_LABELS = [
+    "立地",
+    "ビジョン",
+    "BM堅牢性",
+    "財務健全性",
+    "業界トレンド",
+    "カルチャー",
+    "キャリア成長",
+    "WLB",
+    "採用透明度",
+    "開発環境",
+]
+
+_DIM_EVIDENCE_KEYS = {
+    1: "new_biz_policy_evidence",
+    5: "psychological_safety_evidence",
+    6: "junior_authority_evidence",
+    9: "tech_env_evidence",
+}
+
+
+def _render_xai_panel(detail: dict, dimension_weights: list[float]) -> None:
+    """なぜこの企業がマッチするかを説明するパネル。"""
+    dim_scores = detail.get("dim_scores")
+    if not dim_scores or len(dim_scores) != 10 or len(dimension_weights) != 10:
+        st.info("10次元ベクトルが未計算のため、マッチング説明を表示できません。")
+        return
+
+    ideal = detail["ideal_score"]
+    realistic = detail["realistic_score"]
+    gap = round(ideal - realistic, 4)
+    tech_demand = detail.get("tech_demand", 0.5)
+
+    # スコア差分
+    col_i, col_r, col_g = st.columns(3)
+    with col_i:
+        st.metric("理想スコア", f"{ideal:.3f}", help="コサイン類似度：価値観の一致度")
+    with col_r:
+        delta_str = f"-{gap:.3f}" if gap > 0.005 else None
+        st.metric(
+            "現実的スコア",
+            f"{realistic:.3f}",
+            delta=delta_str,
+            delta_color="inverse",
+        )
+    with col_g:
+        if gap > 0.05:
+            st.metric(
+                "技術ギャップ補正",
+                f"-{gap:.3f}",
+                help=f"企業の技術要求 {tech_demand:.2f} に対してあなたの実務力が低いため割引",
+            )
+        else:
+            st.metric("技術ギャップ補正", "なし ✅")
+
+    # 企業スコア vs ユーザー重み 比較チャート
+    st.markdown("**10次元スコア比較（企業 vs あなたの重み）**")
+    comp_df = pd.DataFrame(
+        {"企業スコア": dim_scores, "あなたの重み": dimension_weights},
+        index=_DIM_LABELS,
+    )
+    st.bar_chart(comp_df, horizontal=True, height=310)
+
+    # 貢献度トップ3次元
+    contributions = [s * w for s, w in zip(dim_scores, dimension_weights, strict=True)]
+    top3 = sorted(range(10), key=lambda i: contributions[i], reverse=True)[:3]
+
+    st.markdown("**マッチ理由トップ3次元**")
+    for rank, idx in enumerate(top3, 1):
+        label = _DIM_LABELS[idx]
+        score = dim_scores[idx]
+        weight = dimension_weights[idx]
+        contrib = contributions[idx]
+        evidence_key = _DIM_EVIDENCE_KEYS.get(idx)
+        evidence = detail.get(evidence_key) if evidence_key else None
+
+        with st.expander(
+            f"#{rank} **{label}**  ー  企業 {score:.2f} × 重み {weight:.3f} = 貢献度 {contrib:.3f}",
+            expanded=(rank == 1),
+        ):
+            if evidence:
+                st.caption(f"根拠: {evidence}")
+            else:
+                st.caption("証拠テキストなし（データ不足 or 該当次元に証拠フィールドなし）")
+
+
+def _render_v2_detail(name: str, rows: list[dict], dimension_weights: list[float]) -> None:
     """V2企業詳細を描画する。"""
     detail = next((r for r in rows if r["name"] == name), None)
     if not detail:
@@ -304,17 +392,19 @@ def _render_v2_detail(name: str, rows: list[dict]) -> None:
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("理想スコア", f"{detail['ideal_score']:.3f}")
-        st.metric("現実的スコア", f"{detail['realistic_score']:.3f}")
-    with col2:
         st.metric("残業", f"{detail.get('avg_overtime_hours') or 'N/A'} h/月")
         st.metric("年収", f"{detail.get('avg_annual_salary') or 'N/A'} 万円")
-    with col3:
+    with col2:
         st.metric("心理的安全性", f"{detail.get('psychological_safety_score') or 'N/A'} / 5")
         st.metric("若手裁量", f"{detail.get('junior_authority_score') or 'N/A'} / 5")
-
-    if detail.get("tech_env_evidence"):
-        st.info(f"**開発環境**: {detail['tech_env_evidence']}")
+    with col3:
+        st.metric("OW評価", f"{detail.get('openwork_score') or 'N/A'} ★")
+        remote_label = {
+            "full": "フルリモート",
+            "partial": "一部リモート",
+            "none": "出社のみ",
+        }.get(detail.get("remote_work_policy") or "", "不明")
+        st.metric("リモート", remote_label)
 
     links = []
     if detail.get("official_url"):
@@ -325,6 +415,10 @@ def _render_v2_detail(name: str, rows: list[dict]) -> None:
         links.append(f"[Green]({detail['green_url']})")
     if links:
         st.markdown("  |  ".join(links))
+
+    st.divider()
+    with st.expander("🔍 なぜこの企業がマッチするか？", expanded=True):
+        _render_xai_panel(detail, dimension_weights)
 
 
 # ─── タブ1: 理想企業 ───────────────────────────────────────────────────────
@@ -351,10 +445,11 @@ with tab_ideal:
     if selected_ideal:
         st.session_state["v2_selected_ideal"] = selected_ideal
 
+    dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
     selected = st.session_state.get("v2_selected_ideal")
     if selected:
         st.divider()
-        _render_v2_detail(selected, ideal_rows)
+        _render_v2_detail(selected, ideal_rows, dw)
 
 # ─── タブ2: 受けるべき企業 ─────────────────────────────────────────────────
 with tab_realistic:
@@ -367,10 +462,11 @@ with tab_realistic:
     if selected_real:
         st.session_state["v2_selected_real"] = selected_real
 
+    dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
     selected = st.session_state.get("v2_selected_real")
     if selected:
         st.divider()
-        _render_v2_detail(selected, realistic_rows)
+        _render_v2_detail(selected, realistic_rows, dw)
 
 
 @st.cache_data(ttl=300)
