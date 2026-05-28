@@ -108,7 +108,7 @@ def _load_all_companies() -> list[dict]:
                     "megatrend_alignment": list(d.megatrend_alignment or []) if d else [],
                     "low_confidence_fields": (list(d.low_confidence_fields or []) if d else []),
                     # 10次元ベクトル
-                    "dim_scores": list(v.dim_scores) if v and v.dim_scores else None,
+                    "dim_scores": list(v.dim_scores) if v and v.dim_scores is not None else None,
                 }
             )
     return rows

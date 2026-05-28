@@ -62,6 +62,7 @@ def post_profile(body: ProfileRequest) -> ProfileResponse:
         eval_preference=body.eval_preference,
         psych_safety_importance=body.psych_safety_importance,
         github_summary=body.github_summary,
+        projects=body.projects,
         recompute_level=body.recompute_level,
     )
     return ProfileResponse(
@@ -77,6 +78,7 @@ def post_profile(body: ProfileRequest) -> ProfileResponse:
         min_salary=saved.min_salary,
         eval_preference=saved.eval_preference,
         psych_safety_importance=saved.psych_safety_importance,
+        projects=list(saved.projects) if saved.projects else None,
     )
 
 
@@ -251,5 +253,5 @@ def get_company(company_id: str) -> CompanyDetailResponse:
         openwork_url=m.openwork_url if m else None,
         green_url=m.green_url if m else None,
         dimensions=dims,
-        dim_scores=list(v.dim_scores) if v and v.dim_scores else None,
+        dim_scores=list(v.dim_scores) if v and v.dim_scores is not None else None,
     )

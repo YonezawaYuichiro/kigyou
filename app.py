@@ -12,18 +12,21 @@ import json
 import uuid
 
 import pandas as pd
-import sqlalchemy as sa
 import streamlit as st
 from anthropic import Anthropic
 from sqlalchemy import select
 
 from backend.api.intent_translator import translate_intent
 from backend.api.matching_engine import compute_matches
-from backend.api.profile_manager import load_or_create_profile, update_dimension_weights
+from backend.api.profile_manager import (
+    load_or_create_profile,
+    update_dimension_weights,
+    update_hard_constraints,
+)
 from backend.api.scorer import calc_score, load_profile
 from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
-from backend.models import Company, CompanyMetrics, UserProfile
+from backend.models import Company, CompanyMetrics
 
 
 @st.cache_resource
@@ -73,101 +76,72 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 _session_id: str = st.session_state["session_id"]
 
-# ─── サイドバー: 重みスライダー ────────────────────────────────────────────
-st.sidebar.header("重み設定")
+# ─── サイドバー: V2クイック設定 ────────────────────────────────────────────
+# V2プロフィールをsession_stateにキャッシュ（毎描画でDB呼び出しを避ける）
+if "v2_profile_cache" not in st.session_state:
+    st.session_state["v2_profile_cache"] = load_or_create_profile(_session_id)
 
-profile = load_profile(PROFILE_PATH)
+_prof = st.session_state["v2_profile_cache"]
+_hard = _prof.hard_constraints or {}
+_dw = list(_prof.dimension_weights) if _prof.dimension_weights is not None else [0.1] * 10
 
-w_tech = st.sidebar.slider("技術成長性", 0.0, 1.0, float(profile["weights"]["tech_growth"]), 0.05)
-w_wlb = st.sidebar.slider("WLB", 0.0, 1.0, float(profile["weights"]["wlb"]), 0.05)
-w_size = st.sidebar.slider("企業規模", 0.0, 1.0, float(profile["weights"]["company_size"]), 0.05)
-w_self = st.sidebar.slider(
-    "自社開発度", 0.0, 1.0, float(profile["weights"]["self_developed"]), 0.05
+st.sidebar.header("クイック設定")
+
+# ── ハードフィルタ ──
+st.sidebar.subheader("絞り込み条件")
+_prefs_raw = st.sidebar.text_input(
+    "勤務地（カンマ区切り・空欄=全国）",
+    value=", ".join(_hard.get("preferred_prefectures", [])),
 )
-w_loc = st.sidebar.slider("立地", 0.0, 1.0, float(profile["weights"]["location"]), 0.05)
+_max_ot_sb = st.sidebar.slider("残業上限（h/月）", 0, 80, int(_hard.get("max_overtime_hours", 30)))
+_remote_sb = st.sidebar.multiselect(
+    "リモートワーク",
+    ["full", "partial", "none"],
+    default=_hard.get("remote_work", ["full", "partial"]),
+    format_func={"full": "フルリモート", "partial": "一部リモート", "none": "出社のみ"}.get,
+)
+_ALL_CATS = ["自社開発", "SIer", "スタートアップ", "受託開発", "その他"]
+_cat_sb = st.sidebar.multiselect(
+    "企業カテゴリ（空欄=全て）",
+    _ALL_CATS,
+    default=[c for c in _hard.get("preferred_categories", []) if c in _ALL_CATS],
+)
 
-total = w_tech + w_wlb + w_size + w_self + w_loc
-if total == 0:
-    st.sidebar.error("重みの合計が 0 です。")
-    st.stop()
-
-normalized = {
-    "tech_growth": w_tech / total,
-    "wlb": w_wlb / total,
-    "company_size": w_size / total,
-    "self_developed": w_self / total,
-    "location": w_loc / total,
+# ── 次元重みスライダー（5主要次元を個別制御、残り5次元は均等配分） ──
+st.sidebar.subheader("重み設定")
+_SB_DIMS = {0: "立地", 5: "カルチャー", 6: "キャリア成長", 7: "WLB", 9: "技術・開発環境"}
+_w_vals = {
+    idx: st.sidebar.slider(label, 0.0, 1.0, float(_dw[idx]) if len(_dw) > idx else 0.1, 0.05)
+    for idx, label in _SB_DIMS.items()
 }
-st.sidebar.caption(f"合計 {total:.2f} → 正規化済み")
+_remaining = max(0.0, 1.0 - sum(_w_vals.values()))
+_other_w = _remaining / 5
+_full_weights = [_other_w] * 10
+for _idx, _v in _w_vals.items():
+    _full_weights[_idx] = _v
+_total_w = sum(_full_weights) or 1.0
+_full_weights = [round(w / _total_w, 4) for w in _full_weights]
+st.sidebar.caption(f"主要5次元合計: {sum(_w_vals.values()):.2f} → 正規化済み")
+
+if st.sidebar.button("✅ 適用して再計算"):
+    _prefectures = [s.strip() for s in _prefs_raw.split(",") if s.strip()]
+    update_hard_constraints(
+        _session_id,
+        {
+            "max_overtime_hours": _max_ot_sb,
+            "remote_work": _remote_sb,
+            "preferred_prefectures": _prefectures,
+            "preferred_categories": _cat_sb,
+        },
+    )
+    update_dimension_weights(_session_id, _full_weights)
+    st.session_state.pop("v2_profile_cache", None)
+    for _k in [k for k in st.session_state if k.startswith("v2_")]:
+        del st.session_state[_k]
+    st.rerun()
 
 st.sidebar.divider()
-st.sidebar.header("ハードフィルター")
-apply_filters = st.sidebar.toggle("ハードフィルターを適用", value=True)
-max_ot = st.sidebar.number_input(
-    "残業上限 (h/月)",
-    min_value=0,
-    max_value=80,
-    value=int(profile["hard_filters"].get("max_overtime_hours", 30)),
-)
-min_score = st.sidebar.number_input(
-    "OpenWork スコア下限",
-    min_value=0.0,
-    max_value=5.0,
-    value=float(profile["hard_filters"].get("min_openwork_score", 3.0)),
-    step=0.1,
-)
-
-min_coverage = st.sidebar.slider("データ充実度（最低項目数）", 0, 5, 0)
-
-st.sidebar.divider()
-st.sidebar.header("スキル・希望")
-req_skills_raw = st.sidebar.text_area(
-    "必須スキル（カンマ区切り）",
-    value=", ".join(profile.get("required_skills", [])),
-)
-bonus_skills_raw = st.sidebar.text_area(
-    "ボーナススキル（カンマ区切り）",
-    value=", ".join(profile.get("bonus_skills", [])),
-)
-prefs_raw = st.sidebar.text_area(
-    "希望都道府県（カンマ区切り）",
-    value=", ".join(profile.get("preferred_prefectures", [])),
-)
-quals_raw = st.sidebar.text_area(
-    "保有資格（カンマ区切り）",
-    value=", ".join(profile.get("qualifications", [])),
-    help="例: 応用情報技術者, AWS認定\n資格は技術成長性スコアにボーナスとして反映されます（最大 +0.25）",
-)
-
-req_skills = [s.strip() for s in req_skills_raw.split(",") if s.strip()]
-bonus_skills = [s.strip() for s in bonus_skills_raw.split(",") if s.strip()]
-preferred_prefs = [s.strip() for s in prefs_raw.split(",") if s.strip()]
-qualifications = [s.strip() for s in quals_raw.split(",") if s.strip()]
-
-active_profile = {
-    **profile,
-    "weights": normalized,
-    "hard_filters": {
-        "max_overtime_hours": max_ot if apply_filters else None,
-        "min_openwork_score": min_score if apply_filters else None,
-    },
-    "required_skills": req_skills,
-    "bonus_skills": bonus_skills,
-    "preferred_prefectures": preferred_prefs,
-    "qualifications": qualifications,
-}
-
-st.sidebar.divider()
-if st.sidebar.button("💾 プロフィールに保存"):
-    updated = {**profile, "weights": {k: round(v, 4) for k, v in normalized.items()}}
-    updated["hard_filters"]["max_overtime_hours"] = max_ot
-    updated["hard_filters"]["min_openwork_score"] = min_score
-    updated["required_skills"] = req_skills
-    updated["bonus_skills"] = bonus_skills
-    updated["preferred_prefectures"] = preferred_prefs
-    updated["qualifications"] = qualifications
-    PROFILE_PATH.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
-    st.sidebar.success("保存しました")
+st.sidebar.page_link("pages/1_profile_setup.py", label="📋 プロフィール詳細設定")
 
 
 # ─── メイン: 3タブ ───────────────────────────────────────────────────────
@@ -188,13 +162,26 @@ def _run_v2_matches() -> dict:
             st.session_state["v2_matches"] = result
             st.session_state["v2_tech_level"] = user_profile.tech_level_score or 0.5
             st.session_state["v2_dimension_weights"] = result.get("dimension_weights", [0.1] * 10)
+            st.session_state["v2_filter_stats"] = result.get("filter_stats", {})
     return st.session_state["v2_matches"]
 
 
 def _render_v2_table(rows: list[dict], score_col: str, score_label: str) -> str | None:
     """V2結果テーブルを描画して選択された企業名を返す。"""
     if not rows:
-        st.info("該当企業が見つかりませんでした。プロフィール設定を確認してください。")
+        stats = st.session_state.get("v2_filter_stats", {})
+        total = stats.get("total_companies", "?")
+        passed = stats.get("passed_hard_filter", "?")
+        has_vec = stats.get("has_vector", "?")
+        st.warning(
+            f"企業が見つかりませんでした　"
+            f"DB: **{total}社** → ハードフィルタ通過: **{passed}社** → ベクトルあり: **{has_vec}社**"
+        )
+        if isinstance(passed, int) and passed == 0:
+            st.caption("残業上限・リモート・勤務地の条件を緩めると企業が表示されます。")
+        elif isinstance(has_vec, int) and has_vec == 0:
+            st.caption("企業のベクトルデータが見つかりません。DBのセットアップを確認してください。")
+        st.page_link("pages/1_profile_setup.py", label="👤 プロフィール設定を開く")
         return None
 
     df = pd.DataFrame(
@@ -205,9 +192,6 @@ def _render_v2_table(rows: list[dict], score_col: str, score_label: str) -> str 
                 "信頼度": "⚠️" if (r.get("overall_confidence") or 1.0) < 0.4 else "✅",
                 "カテゴリ": r["estimated_category"],
                 "都道府県": r["hq_prefecture"],
-                "OW評価": r.get("openwork_score"),
-                "残業h": r.get("avg_overtime_hours"),
-                "年収(万)": r.get("avg_annual_salary"),
             }
             for r in rows
         ]
@@ -220,55 +204,65 @@ def _render_v2_table(rows: list[dict], score_col: str, score_label: str) -> str 
         selection_mode="single-row",
         column_config={
             score_label: st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.3f"),
-            "OW評価": st.column_config.NumberColumn(format="%.2f ★"),
-            "残業h": st.column_config.NumberColumn(format="%.1f h"),
-            "年収(万)": st.column_config.NumberColumn(format="%d 万円"),
         },
     )
     selected = event.selection.rows if event and event.selection else []
     return rows[selected[0]]["name"] if selected else None
 
 
-@st.cache_data(ttl=300)
-def _get_all_tech_levels() -> list[float]:
-    """DB内の全UserProfileのtech_level_scoreを取得する。"""
-    with get_session() as session:
-        rows = (
-            session.execute(
-                sa.select(UserProfile.tech_level_score).where(
-                    UserProfile.tech_level_score.is_not(None)
-                )
-            )
-            .scalars()
-            .all()
-        )
-    return [float(v) for v in rows]
+# 新卒エンジニア志望学生の推定分布（6因子ルーブリック理論値）
+# 各帯の「この帯以上のスコアを持つ学生の割合（上位X%）」の境界値
+_STUDENT_PERCENTILE_THRESHOLDS = [
+    (0.0, 100),
+    (0.2, 85),
+    (0.4, 55),
+    (0.6, 25),
+    (0.8, 7),
+    (1.01, 1),
+]
+# 各スコア帯の学生分布（参照用）
+_STUDENT_REF_DIST = {
+    "初学者  (0.0–0.2)": 15,
+    "基礎あり (0.2–0.4)": 30,
+    "中程度  (0.4–0.6)": 30,
+    "実務近い (0.6–0.8)": 18,
+    "即戦力  (0.8–1.0)": 7,
+}
+
+
+def _estimate_student_percentile(score: float) -> int:
+    """新卒エンジニア志望者の推定分布における「上位X%」を返す。"""
+    for i in range(len(_STUDENT_PERCENTILE_THRESHOLDS) - 1):
+        lo, lo_pct = _STUDENT_PERCENTILE_THRESHOLDS[i]
+        hi, hi_pct = _STUDENT_PERCENTILE_THRESHOLDS[i + 1]
+        if lo <= score < hi:
+            t = (score - lo) / (hi - lo)
+            return max(1, round(lo_pct + t * (hi_pct - lo_pct)))
+    return 1
 
 
 def _render_market_position(tech_level: float) -> None:
-    """ユーザーの実務力スコアを全ユーザーとの相対比較で表示する。"""
-    all_levels = _get_all_tech_levels()
-    if len(all_levels) < 2:
-        return
-    below = sum(1 for v in all_levels if v < tech_level)
-    percentile = round(below / len(all_levels) * 100)
+    """ユーザーの実務力スコアを新卒学生の推定分布と比較して表示する。"""
+    top_pct = _estimate_student_percentile(tech_level)
 
-    if percentile >= 80:
+    if tech_level >= 0.6:
         tier, color = "上位層", "🟢"
-    elif percentile >= 50:
+    elif tech_level >= 0.4:
         tier, color = "中上位層", "🔵"
-    elif percentile >= 20:
+    elif tech_level >= 0.2:
         tier, color = "中位層", "🟡"
     else:
-        tier, color = "初級層", "🟠"
+        tier, color = "基礎層", "🟠"
 
-    with st.expander(f"📊 市場ポジション: {color} {tier}（上位 {100 - percentile}%）"):
+    with st.expander(f"📊 市場ポジション: {color} {tier}（推定 上位 {top_pct}%）"):
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             st.metric("あなたの実務力スコア", f"{tech_level:.2f}")
-            st.caption(f"登録ユーザー {len(all_levels)} 人中 上位 {100 - percentile}% の実務力です")
+            st.caption(
+                f"新卒エンジニア志望者の推定分布で **上位 約{top_pct}%**"
+                f"（6因子ルーブリック理論値。個人差あり）"
+            )
         with col_m2:
-            # tech_level_scoreに基づく「受けるべき企業帯」の目安
             if tech_level >= 0.7:
                 target_range = "大手/メガベンチャー・競争率の高いスタートアップ"
             elif tech_level >= 0.5:
@@ -280,17 +274,70 @@ def _render_market_position(tech_level: float) -> None:
             st.metric("受けるべき企業帯の目安", "")
             st.caption(f"→ {target_range}")
 
-        scores_series = pd.Series(all_levels)
-        hist_data = (
-            pd.cut(
-                scores_series,
-                bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-                labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
-            )
-            .value_counts()
-            .sort_index()
+        # 参照分布（横棒グラフ: ラベルが読みやすい）
+        band_keys = list(_STUDENT_REF_DIST.keys())
+        band_idx = min(int(tech_level / 0.2), 4)
+        ref_df = pd.DataFrame(
+            {
+                "学生の割合(%)": list(_STUDENT_REF_DIST.values()),
+                "あなたの位置": [10 if i == band_idx else 0 for i in range(5)],
+            },
+            index=band_keys,
         )
-        st.bar_chart(hist_data, height=120, x_label="実務力スコア帯", y_label="ユーザー数")
+        st.bar_chart(ref_df, horizontal=True, height=200, x_label="割合(%)")
+        st.caption(
+            f"▲ 推定分布（理論値）  ／  あなた（{tech_level:.2f}）→ **{band_keys[band_idx].strip()}**"
+        )
+
+        st.divider()
+        st.caption(
+            "**実務力スコアの算出方法（6因子ルーブリック・学生基準 / Dreyfus習得モデル準拠）**"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "因子": "F1 実装量",
+                        "0点（未経験）": "実装なし",
+                        "2点（平均的学生）": "個人3件以上/研究室",
+                        "4点（学生上位5%）": "長期インターン(3ヶ月+)/OSS PR",
+                    },
+                    {
+                        "因子": "F2 実装品質",
+                        "0点（未経験）": "評価不可",
+                        "2点（平均的学生）": "基本設計パターンあり",
+                        "4点（学生上位5%）": "テスト+CI/CD+コードレビュー",
+                    },
+                    {
+                        "因子": "F3 技術幅",
+                        "0点（未経験）": "1領域のみ",
+                        "2点（平均的学生）": "フルスタック",
+                        "4点（学生上位5%）": "フルスタック+AI/ML+インフラ全揃い",
+                    },
+                    {
+                        "因子": "F4 技術深度",
+                        "0点（未経験）": "入門書レベル",
+                        "2点（平均的学生）": "自力デバッグ可",
+                        "4点（学生上位5%）": "複雑設計/AtCoder水色/AI論文実装",
+                    },
+                    {
+                        "因子": "F5 資格・競プロ",
+                        "0点（未経験）": "なし",
+                        "2点（平均的学生）": "応用情報/AWS Associate/AtCoder茶",
+                        "4点（学生上位5%）": "IPA高度試験/AtCoder水色以上",
+                    },
+                    {
+                        "因子": "F6 外部発信",
+                        "0点（未経験）": "なし",
+                        "2点（平均的学生）": "Qiita10本以上/勉強会登壇",
+                        "4点（学生上位5%）": "Kaggle Expert以上/学会発表",
+                    },
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption("スコア = (F1+F2+F3+F4+F5+F6) ÷ 24　※最大24点 → 1.0（学生基準）")
 
 
 _DIM_LABELS = [
@@ -312,6 +359,48 @@ _DIM_EVIDENCE_KEYS = {
     6: "junior_authority_evidence",
     9: "tech_env_evidence",
 }
+
+_REMOTE_LABELS = {"full": "フルリモート", "partial": "一部リモート", "none": "出社のみ"}
+
+
+def _get_dim_evidence(idx: int, detail: dict) -> str | None:
+    """次元インデックスに対応する証拠テキストを取得 or 手元データから合成する。"""
+    # 専用フィールドがある次元を優先
+    ev = detail.get(_DIM_EVIDENCE_KEYS[idx]) if idx in _DIM_EVIDENCE_KEYS else None
+    if ev:
+        return ev
+
+    # 手元データから合成
+    if idx == 0:  # 立地
+        pref = detail.get("hq_prefecture")
+        return f"本社所在地: {pref}" if pref else None
+    if idx == 2:  # BM堅牢性
+        cat = detail.get("estimated_category")
+        return f"事業カテゴリ: {cat}" if cat else None
+    if idx == 3:  # 財務健全性
+        parts = []
+        if detail.get("employee_count"):
+            parts.append(f"従業員 {detail['employee_count']}名")
+        if detail.get("openwork_score"):
+            parts.append(f"OW評価 {detail['openwork_score']:.1f}★")
+        return " / ".join(parts) if parts else None
+    if idx == 4:  # 業界トレンド
+        ts = detail.get("tech_stack")
+        return f"技術スタック: {', '.join(ts[:6])}" if ts else None
+    if idx == 7:  # WLB
+        parts = []
+        ot = detail.get("avg_overtime_hours")
+        if ot is not None:
+            parts.append(f"残業 {ot:.0f}h/月")
+        remote = _REMOTE_LABELS.get(detail.get("remote_work_policy") or "", "")
+        if remote:
+            parts.append(remote)
+        return " / ".join(parts) if parts else None
+    if idx == 8:  # 採用透明度
+        ct = detail.get("has_coding_test")
+        if ct is not None:
+            return f"コーディングテスト: {'あり' if ct else 'なし'}"
+    return None
 
 
 def _render_xai_panel(detail: dict, dimension_weights: list[float]) -> None:
@@ -348,13 +437,27 @@ def _render_xai_panel(detail: dict, dimension_weights: list[float]) -> None:
         else:
             st.metric("技術ギャップ補正", "なし ✅")
 
-    # 企業スコア vs ユーザー重み 比較チャート
+    # 企業スコア vs ユーザー重み 比較（dataframeで静的表示 → スクロール時リサイズなし）
     st.markdown("**10次元スコア比較（企業 vs あなたの重み）**")
     comp_df = pd.DataFrame(
-        {"企業スコア": dim_scores, "あなたの重み": dimension_weights},
-        index=_DIM_LABELS,
+        {
+            "次元": _DIM_LABELS,
+            "企業スコア": [round(s, 3) for s in dim_scores],
+            "あなたの重み": [round(w, 3) for w in dimension_weights],
+        }
     )
-    st.bar_chart(comp_df, horizontal=True, height=310)
+    st.dataframe(
+        comp_df,
+        hide_index=True,
+        use_container_width=True,
+        height=385,
+        column_config={
+            "企業スコア": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.3f"),
+            "あなたの重み": st.column_config.ProgressColumn(
+                min_value=0, max_value=0.5, format="%.3f"
+            ),
+        },
+    )
 
     # 貢献度トップ3次元
     contributions = [s * w for s, w in zip(dim_scores, dimension_weights, strict=True)]
@@ -366,8 +469,7 @@ def _render_xai_panel(detail: dict, dimension_weights: list[float]) -> None:
         score = dim_scores[idx]
         weight = dimension_weights[idx]
         contrib = contributions[idx]
-        evidence_key = _DIM_EVIDENCE_KEYS.get(idx)
-        evidence = detail.get(evidence_key) if evidence_key else None
+        evidence = _get_dim_evidence(idx, detail)
 
         with st.expander(
             f"#{rank} **{label}**  ー  企業 {score:.2f} × 重み {weight:.3f} = 貢献度 {contrib:.3f}",
@@ -376,7 +478,7 @@ def _render_xai_panel(detail: dict, dimension_weights: list[float]) -> None:
             if evidence:
                 st.caption(f"根拠: {evidence}")
             else:
-                st.caption("証拠テキストなし（データ不足 or 該当次元に証拠フィールドなし）")
+                st.caption("根拠データなし（この次元の証拠情報はDBに未登録）")
 
 
 def _render_v2_detail(name: str, rows: list[dict], dimension_weights: list[float]) -> None:
@@ -391,21 +493,34 @@ def _render_v2_detail(name: str, rows: list[dict], dimension_weights: list[float
             f"情報不足（信頼度 {conf:.2f}）: LLM抽出データが少ないため精度が低い可能性があります。"
         )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("残業", f"{detail.get('avg_overtime_hours') or 'N/A'} h/月")
-        st.metric("年収", f"{detail.get('avg_annual_salary') or 'N/A'} 万円")
-    with col2:
-        st.metric("心理的安全性", f"{detail.get('psychological_safety_score') or 'N/A'} / 5")
-        st.metric("若手裁量", f"{detail.get('junior_authority_score') or 'N/A'} / 5")
-    with col3:
-        st.metric("OW評価", f"{detail.get('openwork_score') or 'N/A'} ★")
-        remote_label = {
-            "full": "フルリモート",
-            "partial": "一部リモート",
-            "none": "出社のみ",
-        }.get(detail.get("remote_work_policy") or "", "不明")
-        st.metric("リモート", remote_label)
+    # データがある項目だけ収集（ない項目は表示しない）
+    _avail: list[tuple[str, str]] = []
+    _ot = detail.get("avg_overtime_hours")
+    if _ot is not None:
+        _avail.append(("残業", f"{_ot:.0f} h/月"))
+    _sal = detail.get("avg_annual_salary")
+    if _sal is not None:
+        _avail.append(("年収", f"{_sal:.0f} 万円"))
+    _ps = detail.get("psychological_safety_score")
+    if _ps is not None:
+        _avail.append(("心理的安全性", f"{_ps:.1f} / 5"))
+    _ja = detail.get("junior_authority_score")
+    if _ja is not None:
+        _avail.append(("若手裁量", f"{_ja:.1f} / 5"))
+    _ow = detail.get("openwork_score")
+    if _ow is not None:
+        _avail.append(("OW評価", f"{_ow:.2f} ★"))
+    _remote = _REMOTE_LABELS.get(detail.get("remote_work_policy") or "", "")
+    if _remote:
+        _avail.append(("リモート", _remote))
+
+    if _avail:
+        _cols = st.columns(min(len(_avail), 3))
+        for _i, (_lbl, _val) in enumerate(_avail):
+            with _cols[_i % 3]:
+                st.metric(_lbl, _val)
+    else:
+        st.caption("数値データなし（OpenWork・LLM抽出の情報が未取得）")
 
     links = []
     if detail.get("official_url"):
@@ -425,9 +540,11 @@ def _render_v2_detail(name: str, rows: list[dict], dimension_weights: list[float
 # ─── タブ1: 理想企業 ───────────────────────────────────────────────────────
 with tab_ideal:
     tech_level = st.session_state.get("v2_tech_level", 0.5)
-    st.caption(
-        f"あなたの実務力スコア: **{tech_level:.2f}** / 1.0　　[プロフィール設定](./1_profile_setup)で更新できます。"
-    )
+    col_score, col_link = st.columns([3, 1])
+    with col_score:
+        st.caption(f"あなたの実務力スコア: **{tech_level:.2f}** / 1.0")
+    with col_link:
+        st.page_link("pages/1_profile_setup.py", label="👤 プロフィール設定で更新")
 
     _render_market_position(tech_level)
 
@@ -573,6 +690,100 @@ def _fetch_companies() -> list[dict]:
 
 # ─── タブ3: 従来スコアリング（V1） ────────────────────────────────────────
 with tab_v1:
+    # V1設定（従来のサイドバー項目をタブ内エクスパンダーに移動）
+    with st.expander("⚙️ V1スコアリング設定", expanded=False):
+        _v1_profile = load_profile(PROFILE_PATH)
+        _v1_col1, _v1_col2 = st.columns(2)
+        with _v1_col1:
+            _w_tech = st.slider(
+                "技術成長性",
+                0.0,
+                1.0,
+                float(_v1_profile["weights"]["tech_growth"]),
+                0.05,
+                key="v1_w_tech",
+            )
+            _w_wlb = st.slider(
+                "WLB", 0.0, 1.0, float(_v1_profile["weights"]["wlb"]), 0.05, key="v1_w_wlb"
+            )
+            _w_size = st.slider(
+                "企業規模",
+                0.0,
+                1.0,
+                float(_v1_profile["weights"]["company_size"]),
+                0.05,
+                key="v1_w_size",
+            )
+        with _v1_col2:
+            _w_self = st.slider(
+                "自社開発度",
+                0.0,
+                1.0,
+                float(_v1_profile["weights"]["self_developed"]),
+                0.05,
+                key="v1_w_self",
+            )
+            _w_loc = st.slider(
+                "立地", 0.0, 1.0, float(_v1_profile["weights"]["location"]), 0.05, key="v1_w_loc"
+            )
+        _v1_total = _w_tech + _w_wlb + _w_size + _w_self + _w_loc or 1.0
+        _v1_norm = {
+            "tech_growth": _w_tech / _v1_total,
+            "wlb": _w_wlb / _v1_total,
+            "company_size": _w_size / _v1_total,
+            "self_developed": _w_self / _v1_total,
+            "location": _w_loc / _v1_total,
+        }
+        st.caption(f"合計 {_v1_total:.2f} → 正規化済み")
+        _v1_c1, _v1_c2 = st.columns(2)
+        with _v1_c1:
+            apply_filters = st.toggle("ハードフィルターを適用", value=True, key="v1_apply_filters")
+            min_coverage = st.slider("データ充実度（最低項目数）", 0, 5, 0, key="v1_min_coverage")
+        with _v1_c2:
+            _v1_max_ot = st.number_input(
+                "残業上限 (h/月)",
+                0,
+                80,
+                int(_v1_profile["hard_filters"].get("max_overtime_hours", 30)),
+                key="v1_max_ot",
+            )
+            _v1_min_score = st.number_input(
+                "OpenWork スコア下限",
+                0.0,
+                5.0,
+                float(_v1_profile["hard_filters"].get("min_openwork_score", 3.0)),
+                step=0.1,
+                key="v1_min_score",
+            )
+        _v1_req_raw = st.text_input(
+            "必須スキル（カンマ区切り）",
+            value=", ".join(_v1_profile.get("required_skills", [])),
+            key="v1_req_skills",
+        )
+        _v1_bonus_raw = st.text_input(
+            "ボーナススキル（カンマ区切り）",
+            value=", ".join(_v1_profile.get("bonus_skills", [])),
+            key="v1_bonus_skills",
+        )
+        _v1_prefs_raw = st.text_input(
+            "希望都道府県（カンマ区切り）",
+            value=", ".join(_v1_profile.get("preferred_prefectures", [])),
+            key="v1_prefs",
+        )
+
+    active_profile = {
+        **_v1_profile,
+        "weights": _v1_norm,
+        "hard_filters": {
+            "max_overtime_hours": _v1_max_ot if apply_filters else None,
+            "min_openwork_score": _v1_min_score if apply_filters else None,
+        },
+        "required_skills": [s.strip() for s in _v1_req_raw.split(",") if s.strip()],
+        "bonus_skills": [s.strip() for s in _v1_bonus_raw.split(",") if s.strip()],
+        "preferred_prefectures": [s.strip() for s in _v1_prefs_raw.split(",") if s.strip()],
+        "qualifications": _v1_profile.get("qualifications", []),
+    }
+
     raw_rows = _fetch_companies()
 
     results = []

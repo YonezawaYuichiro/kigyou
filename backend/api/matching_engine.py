@@ -10,6 +10,7 @@ pgvector コサイン類似度でマッチングし、理想スコアと現実�
 """
 
 import logging
+import re
 from typing import Any
 
 import sqlalchemy as sa
@@ -24,12 +25,18 @@ logger = logging.getLogger(__name__)
 _TOP_K = 50
 
 
+def _normalize_pref(p: str) -> str:
+    """都/道/府/県 サフィックスを除去して正規化する（「大阪府」→「大阪」）。"""
+    return re.sub(r"[都道府県]$", "", p.strip())
+
+
 def _build_filter_set(hard_constraints: dict[str, Any]) -> set[str]:
     """ハードフィルタを通過した企業IDの集合を返す（str(UUID)）。"""
     max_ot = hard_constraints.get("max_overtime_hours")
     min_score = hard_constraints.get("min_openwork_score")
     remote_ok = hard_constraints.get("remote_work", [])
-    prefectures = hard_constraints.get("preferred_prefectures", [])
+    prefectures = [_normalize_pref(p) for p in hard_constraints.get("preferred_prefectures", [])]
+    categories = hard_constraints.get("preferred_categories", [])
 
     passed: set[str] = set()
     with get_session() as session:
@@ -46,7 +53,9 @@ def _build_filter_set(hard_constraints: dict[str, Any]) -> set[str]:
                 continue
             if remote_ok and m and m.remote_work_policy and m.remote_work_policy not in remote_ok:
                 continue
-            if prefectures and company.hq_prefecture not in prefectures:
+            if prefectures and _normalize_pref(company.hq_prefecture or "") not in prefectures:
+                continue
+            if categories and company.estimated_category not in categories:
                 continue
             passed.add(str(company.id))
     return passed
@@ -154,17 +163,37 @@ def _enrich_results(matches: list[dict[str, Any]], tech_level: float) -> list[di
                     "new_biz_policy_evidence": dims.new_biz_policy_evidence if dims else None,
                     "has_coding_test": dims.has_coding_test if dims else None,
                     # CompanyVector: 10次元スコア
-                    "dim_scores": list(vec.dim_scores) if vec and vec.dim_scores else None,
+                    "dim_scores": list(vec.dim_scores)
+                    if vec and vec.dim_scores is not None
+                    else None,
                 }
             )
     return enriched
 
 
-def compute_matches(user_profile: UserProfile) -> dict[str, list[dict[str, Any]]]:
+def _count_companies_with_vector(filtered_ids: set[str]) -> int:
+    """filtered_ids のうち company_vector が存在する企業数を返す。"""
+    if not filtered_ids:
+        return 0
+    sql = sa.text("""
+        SELECT COUNT(*) FROM company_vector cv
+        WHERE cv.company_id::text = ANY(:ids) AND cv.dim_scores IS NOT NULL
+    """)
+    with get_session() as session:
+        return int(session.execute(sql, {"ids": list(filtered_ids)}).scalar() or 0)
+
+
+def _count_all_companies() -> int:
+    """DB上の全企業数を返す。"""
+    with get_session() as session:
+        return int(session.execute(sa.select(sa.func.count()).select_from(Company)).scalar() or 0)
+
+
+def compute_matches(user_profile: UserProfile) -> dict[str, Any]:
     """マッチングを実行し、ideal/realistic ランキングを返す。
 
     Returns:
-        {"ideal": [...], "realistic": [...]}  各リストはスコア降順
+        {"ideal": [...], "realistic": [...], "dimension_weights": [...], "filter_stats": {...}}
     """
     hard = user_profile.hard_constraints or {}
     weights: list[float] = (
@@ -176,8 +205,21 @@ def compute_matches(user_profile: UserProfile) -> dict[str, list[dict[str, Any]]
 
     logger.info("マッチング開始: tech_level=%.2f", tech_level)
 
+    total_companies = _count_all_companies()
     filtered_ids = _build_filter_set(hard)
-    logger.info("ハードフィルタ通過: %d社", len(filtered_ids))
+    has_vector = _count_companies_with_vector(filtered_ids)
+    logger.info(
+        "ハードフィルタ通過: %d/%d社 / ベクトルあり: %d社",
+        len(filtered_ids),
+        total_companies,
+        has_vector,
+    )
+
+    filter_stats = {
+        "total_companies": total_companies,
+        "passed_hard_filter": len(filtered_ids),
+        "has_vector": has_vector,
+    }
 
     raw_matches = _query_cosine_matches(weights, filtered_ids)
     logger.info("ベクトル類似度取得: %d社", len(raw_matches))
@@ -187,10 +229,14 @@ def compute_matches(user_profile: UserProfile) -> dict[str, list[dict[str, Any]]
     ideal = sorted(enriched, key=lambda x: x["ideal_score"], reverse=True)
     realistic = sorted(enriched, key=lambda x: x["realistic_score"], reverse=True)
 
-    # ランク番号を付与
     for i, r in enumerate(ideal, 1):
         r["rank_ideal"] = i
     for i, r in enumerate(realistic, 1):
         r["rank_realistic"] = i
 
-    return {"ideal": ideal, "realistic": realistic, "dimension_weights": weights}
+    return {
+        "ideal": ideal,
+        "realistic": realistic,
+        "dimension_weights": weights,
+        "filter_stats": filter_stats,
+    }

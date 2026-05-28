@@ -1,7 +1,7 @@
 """プロフィール設定ウィザード（V3）。
 
 4ステップでユーザーの実力・条件を入力し DB に保存する。
-  Step 1: スキル・経験入力（GitHub URL → 自動解析）
+  Step 1: スキル・経験入力（製作物カード複数 + GitHub URL）
   Step 2: 志望軸（業界・職種・開発フェーズ・希望年収）
   Step 3: 勤務条件（絶対条件 / 希望条件）
   Step 4: 確認・保存 → Sonnet 4.6 で tech_level_score 算出
@@ -30,13 +30,59 @@ if "profile_loaded" not in st.session_state:
 profile = st.session_state["db_profile"]
 
 if "wizard_step" not in st.session_state:
-    st.session_state["wizard_step"] = 1
+    st.session_state["wizard_step"] = 0
 
 step = st.session_state["wizard_step"]
-st.progress(step / 4, text=f"ステップ {step} / 4")
+if step > 0:
+    st.progress(step / 4, text=f"ステップ {step} / 4")
+
+_PROJ_TYPES = ["個人開発", "インターン", "業務", "研究"]
+_TEAM_SIZES = ["ソロ", "2〜5人", "5人以上"]
+
+
+def _safe_index(lst: list, val: str, default: int = 0) -> int:
+    return lst.index(val) if val in lst else default
+
+
+# ─── Step 0: 現在の設定確認 ───────────────────────────────────────────────
+if step == 0:
+    st.subheader("現在のプロフィール設定")
+
+    hard = profile.hard_constraints or {}
+    col1, col2 = st.columns(2)
+    with col1:
+        score_str = f"{profile.tech_level_score:.2f}" if profile.tech_level_score else "未算出"
+        st.metric("実務力スコア", score_str)
+        if profile.tech_level_rationale:
+            st.caption(profile.tech_level_rationale)
+        st.markdown(f"**スキル**: {', '.join(profile.tech_skills or []) or '未入力'}")
+        st.markdown(f"**資格**: {', '.join(profile.qualifications or []) or 'なし'}")
+        st.markdown(f"**製作物**: {len(profile.projects or [])}件")
+        st.markdown(f"**志望業界**: {', '.join(profile.target_industries or []) or '未選択'}")
+        st.markdown(f"**志望職種**: {', '.join(profile.target_roles or []) or '未選択'}")
+    with col2:
+        _prefs = hard.get("preferred_prefectures", [])
+        _cats = hard.get("preferred_categories", [])
+        st.markdown(f"**勤務地**: {', '.join(_prefs) or '不問'}")
+        st.markdown(f"**企業カテゴリ**: {', '.join(_cats) or '全て'}")
+        st.markdown(f"**残業上限**: {hard.get('max_overtime_hours', '未設定')} h/月")
+        _rl = {"full": "フルリモート", "partial": "一部リモート", "none": "出社のみ"}
+        _remote_str = ", ".join(_rl.get(r, r) for r in hard.get("remote_work", []))
+        st.markdown(f"**リモート**: {_remote_str or '未設定'}")
+        st.markdown(f"**開発フェーズ**: {profile.dev_phase_preference or '未設定'}")
+        st.markdown(f"**評価制度**: {profile.eval_preference or '未設定'}")
+
+    st.divider()
+    col_edit, col_back = st.columns(2)
+    with col_edit:
+        if st.button("✏️ プロフィールを編集", type="primary"):
+            st.session_state["wizard_step"] = 1
+            st.rerun()
+    with col_back:
+        st.page_link("app.py", label="← マッチングに戻る")
 
 # ─── Step 1: スキル・経験入力 ─────────────────────────────────────────────
-if step == 1:
+elif step == 1:
     st.subheader("Step 1: スキル・開発経験")
 
     col_a, col_b = st.columns(2)
@@ -52,7 +98,7 @@ if step == 1:
         major = st.text_input(
             "専攻・研究分野",
             value=profile.major or "",
-            placeholder="例: 情報工学, データサイエンス, 電子工学",
+            placeholder="例: 情報工学, データサイエンス",
         )
 
     tech_skills_raw = st.text_area(
@@ -66,17 +112,112 @@ if step == 1:
         help="例: 応用情報技術者, G検定, AWS認定",
     )
     project_exp = st.text_area(
-        "個人開発・インターン経験（自由記述）",
+        "補足・自由記述（任意）",
         value=profile.project_experience or "",
-        height=180,
-        placeholder=(
-            "例:\n"
-            "・Djangoでポートフォリオサイトを個人開発（AWS EC2 + RDS 構成）\n"
-            "・3ヶ月の長期インターンでMLパイプラインのCI/CD整備を担当\n"
-            "・PyTorchで画像分類モデルを実装、Edge AIデバイスへデプロイ"
-        ),
+        height=80,
+        placeholder="製作物カードに書ききれない補足情報があればここへ",
     )
 
+    # ── 製作物カード ──────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("**製作物・ポートフォリオ**（プライベートリポジトリも記載できます）")
+
+    if "w1_projects" not in st.session_state:
+        st.session_state["w1_projects"] = list(profile.projects or [])
+
+    projects_list: list[dict] = st.session_state["w1_projects"]
+
+    delete_idx: int | None = None
+    for i, proj in enumerate(projects_list):
+        label = proj.get("name") or f"製作物 {i + 1}"
+        badge = " 🤖" if proj.get("is_ai") else ""
+        with st.expander(f"{i + 1}. {label}{badge}", expanded=(i == len(projects_list) - 1)):
+            c1, c2 = st.columns(2)
+            with c1:
+                name = st.text_input("プロジェクト名", value=proj.get("name", ""), key=f"pname_{i}")
+                ptype = st.selectbox(
+                    "種別",
+                    _PROJ_TYPES,
+                    index=_safe_index(_PROJ_TYPES, proj.get("type", "個人開発")),
+                    key=f"ptype_{i}",
+                )
+            with c2:
+                team_size = st.selectbox(
+                    "チーム規模",
+                    _TEAM_SIZES,
+                    index=_safe_index(_TEAM_SIZES, proj.get("team_size", "ソロ")),
+                    key=f"pteam_{i}",
+                )
+                duration = st.text_input(
+                    "期間",
+                    value=proj.get("duration", ""),
+                    placeholder="例: 3ヶ月, 1年",
+                    key=f"pdur_{i}",
+                )
+
+            description = st.text_area(
+                "概要",
+                value=proj.get("description", ""),
+                height=80,
+                placeholder="何を作ったか、どんな工夫をしたかを2〜3行で",
+                key=f"pdesc_{i}",
+            )
+            stack_raw = st.text_input(
+                "技術スタック（カンマ区切り）",
+                value=", ".join(proj.get("tech_stack") or []),
+                placeholder="例: Python, FastAPI, PostgreSQL, React",
+                key=f"pstack_{i}",
+            )
+            c3, c4 = st.columns([2, 1])
+            with c3:
+                repo_url = st.text_input(
+                    "リポジトリURL（任意）",
+                    value=proj.get("repo_url", "") or "",
+                    placeholder="https://github.com/...",
+                    key=f"prepo_{i}",
+                )
+            with c4:
+                is_ai = st.checkbox(
+                    "AI/ML開発",
+                    value=bool(proj.get("is_ai", False)),
+                    key=f"pai_{i}",
+                )
+
+            if st.button("🗑 この製作物を削除", key=f"del_{i}"):
+                delete_idx = i
+
+            # 現在値をリストに書き戻す
+            projects_list[i] = {
+                "name": name,
+                "type": ptype,
+                "description": description,
+                "tech_stack": [t.strip() for t in stack_raw.split(",") if t.strip()],
+                "is_ai": is_ai,
+                "team_size": team_size,
+                "duration": duration,
+                "repo_url": repo_url.strip() or None,
+            }
+
+    if delete_idx is not None:
+        projects_list.pop(delete_idx)
+        st.rerun()
+
+    if st.button("➕ 製作物を追加"):
+        projects_list.append(
+            {
+                "name": "",
+                "type": "個人開発",
+                "description": "",
+                "tech_stack": [],
+                "is_ai": False,
+                "team_size": "ソロ",
+                "duration": "",
+                "repo_url": None,
+            }
+        )
+        st.rerun()
+
+    # ── GitHub ────────────────────────────────────────────────────────────
     st.divider()
     st.markdown("**GitHub（任意）— 公開リポジトリを自動解析してスコア精度を上げます**")
     col_gh, col_gh_btn = st.columns([4, 1])
@@ -91,7 +232,7 @@ if step == 1:
         analyze_btn = st.button("🔍 解析", key="gh_analyze_btn")
 
     if analyze_btn and github_url_input.strip():
-        with st.spinner("GitHub APIで解析中..."):
+        with st.spinner("GitHub APIでリポジトリを取得し、コード内容を Haiku で解析中..."):
             gh_result = analyze_github(github_url_input.strip())
         if gh_result.get("error"):
             st.error(gh_result["error"])
@@ -108,10 +249,30 @@ if step == 1:
 
     if "w1_github_result" in st.session_state:
         gr = st.session_state["w1_github_result"]
-        st.caption(
-            f"複雑さスコア: {gr['project_complexity_score']:.2f} / "
-            f"OSSコントリビュート: {'あり' if gr['oss_contribution'] else 'なし'}"
-        )
+        c_a, c_b, c_c, c_d = st.columns(4)
+        c_a.metric("複雑さスコア", f"{gr['project_complexity_score']:.2f}")
+        c_b.metric("テストコード", "あり" if gr.get("has_tests") else "なし")
+        c_c.metric("CI/CD", "設定あり" if gr.get("has_ci") else "なし")
+        c_d.metric("AI/ML開発", "あり" if gr.get("is_ai_ml") else "なし")
+
+        if gr.get("quality_indicators"):
+            st.caption("品質指標: " + " / ".join(gr["quality_indicators"]))
+        if gr.get("tech_highlights"):
+            st.caption("検出技術: " + " / ".join(gr["tech_highlights"]))
+
+        analyses = gr.get("repo_analyses", [])
+        if analyses:
+            with st.expander("リポジトリ詳細評価（Haiku）"):
+                for a in analyses:
+                    st.markdown(f"**{a.get('repo_name', '')}**")
+                    st.caption(a.get("assessment", ""))
+                    qi = a.get("quality_indicators", [])
+                    th = a.get("tech_highlights", [])
+                    if qi or th:
+                        st.caption(
+                            ("品質: " + ", ".join(qi) if qi else "")
+                            + (" / 技術: " + ", ".join(th) if th else "")
+                        )
 
     if st.button("次へ →", type="primary"):
         st.session_state["w1_graduation_year"] = graduation_year
@@ -123,6 +284,7 @@ if step == 1:
             s.strip() for s in qualifications_raw.split(",") if s.strip()
         ]
         st.session_state["w1_project_exp"] = project_exp
+        # w1_projects はすでに session_state に書き戻し済み
         st.session_state["wizard_step"] = 2
         st.rerun()
 
@@ -293,6 +455,7 @@ elif step == 4:
     skills = st.session_state.get("w1_tech_skills", [])
     quals = st.session_state.get("w1_qualifications", [])
     exp = st.session_state.get("w1_project_exp", "")
+    projects = st.session_state.get("w1_projects", [])
     grad_year = st.session_state.get("w1_graduation_year")
     major_val = st.session_state.get("w1_major", "")
     industries = st.session_state.get("w2_target_industries", [])
@@ -325,6 +488,16 @@ elif step == 4:
             st.markdown(f"**評価制度**: {eval_pref or 'こだわらない'}")
             st.markdown(f"**心理的安全性重視度**: {psych_safety:.1f}")
             st.markdown(f"**MBTI**: {mbti_val or '未入力'}")
+
+        if projects:
+            st.markdown(f"**製作物**: {len(projects)}件")
+            for p in projects:
+                ai_badge = " 🤖" if p.get("is_ai") else ""
+                st.caption(
+                    f"・{p.get('name', '無題')}（{p.get('type', '')} / "
+                    f"{p.get('team_size', '')} / {p.get('duration', '')}）{ai_badge}"
+                )
+
         if gh_result:
             st.markdown(
                 f"**GitHub**: @{gh_result['username']} "
@@ -332,12 +505,9 @@ elif step == 4:
                 f"複雑さ{gh_result['project_complexity_score']:.2f}）"
             )
 
-    if github_summary:
-        st.info("GitHubの活動データも Sonnet 4.6 の評価に反映されます。")
-    else:
-        st.info(
-            "「保存して分析」を押すと Sonnet 4.6 で実務力スコアを算出します（数秒かかります）。"
-        )
+    st.info(
+        "「保存してマッチング」を押すと Sonnet 4.6 で実務力スコアを算出します（数秒かかります）。"
+    )
 
     col_back, col_save = st.columns(2)
     with col_back:
@@ -365,12 +535,14 @@ elif step == 4:
                     eval_preference=eval_pref,
                     psych_safety_importance=psych_safety,
                     github_summary=github_summary,
+                    projects=projects or None,
                     recompute_level=True,
                 )
             st.session_state["db_profile"] = saved
             st.session_state["profile_loaded"] = True
+            # v2キャッシュをすべてクリアしてマッチング再実行を促す
             for key in list(st.session_state.keys()):
-                if key.startswith("v2_matches"):
+                if key.startswith("v2_"):
                     del st.session_state[key]
 
             st.success(
@@ -379,5 +551,5 @@ elif step == 4:
             )
             if github_summary:
                 st.caption(f"GitHub @{gh_result['username']} のデータも評価に反映されました。")
-            st.caption("トップページに戻ってV2マッチングタブを確認してください。")
-            st.session_state["wizard_step"] = 1
+            st.session_state["wizard_step"] = 0
+            st.rerun()

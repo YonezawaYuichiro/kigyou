@@ -27,6 +27,7 @@ class ProfileRequest(BaseModel):
     eval_preference: str | None = None
     psych_safety_importance: float | None = None
     github_summary: str | None = None
+    projects: list[dict] | None = None
     recompute_level: bool = True
 
 
@@ -43,6 +44,7 @@ class ProfileResponse(BaseModel):
     min_salary: int | None
     eval_preference: str | None
     psych_safety_importance: float | None
+    projects: list[dict] | None
 
 
 # ── 企業一覧 ──────────────────────────────────────────────────────────────────

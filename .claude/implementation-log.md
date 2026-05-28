@@ -2,6 +2,32 @@
 
 ---
 
+## 2026-05-28: V3 UI改善・サイドバー統合・評価基準刷新（V3完了）
+
+- **実装内容**:
+  - `app.py` — サイドバーをV2 UserProfile基準に全面改修（V1 my_profile.json依存を廃止）。クイック設定（勤務地・カテゴリ・リモート・重みスライダー）を「✅ 適用して再計算」ボタンで一括反映。V1コントロールをtab_v1内に移動
+  - `app.py` — `_render_v2_table()` からOW評価・残業h・年収(万)列を削除（平等にかからない情報のため）
+  - `app.py` — `_render_v2_detail()` を動的表示に変更（Noneのメトリクスは完全非表示、`st.metric` でリスト化）
+  - `app.py` — `_get_dim_evidence()` 追加：専用証拠フィールドがない次元（立地・WLB等）は手元データから証拠テキストを合成
+  - `app.py` — `_render_xai_panel()` の横棒グラフを `st.bar_chart` → `st.dataframe + ProgressColumn` に変更（スクロールリサイズ問題を回避）
+  - `app.py` — `_render_market_position()` を固定参照分布（理論的正規分布）ベースに変更（DB登録者数依存を廃止）
+  - `pages/1_profile_setup.py` — Step 0（現在の設定確認ページ）追加。初期wizard_stepを0に変更
+  - `backend/api/matching_engine.py` — `_normalize_pref()` 追加（「大阪府」と「大阪」を同一視）、`_build_filter_set()` に `preferred_categories` フィルタ追加
+  - `backend/api/profile_manager.py` — `update_hard_constraints()` 追加（サイドバー用、hard_constraintsのみ直接上書き）
+  - `backend/api/profile_manager.py` — 実務力評価を6因子ルーブリックに刷新（F1:実装量, F2:実装品質, F3:技術幅, F4:技術深度, F5:資格, F6:外部発信）。LLM出力を6スコアに限定してPython側で機械計算（LLMのホリスティック判断を排除）
+
+- **設計判断**:
+  - サイドバー/profile_setupがV1(my_profile.json)とV2(UserProfile DB)に分裂していた根本問題を解消。V2 UserProfileを唯一のソースとして統合
+  - 「出来レース」感を排除するため、Dreyfus習得モデル・IPA ITスキル標準に基づく5+1因子ルーブリックへ。採点は `(F1+F2+F3+F4+F5+F6)/24` のPython算術計算で決定論的にする
+  - パーセンタイル表示を「登録ユーザーX人中」→「新卒学生推定分布」に変更。固定参照分布なのでユーザー数に関わらず意味のある比較が可能
+  - グラフのスクロールリサイズはStreamlit既知バグ。`st.dataframe + ProgressColumn` は静的レンダリングのため影響なし
+
+- **動作確認**: ruff check ALL PASS（`ruff check app.py backend/api/matching_engine.py backend/api/profile_manager.py pages/1_profile_setup.py`）
+
+- **残課題**: V3完了。V4方針はユーザーと別途決定
+
+---
+
 ## 2026-05-28: V3 Phase 6 — FastAPI化
 
 - **実装内容**:

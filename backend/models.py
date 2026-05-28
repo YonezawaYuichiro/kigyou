@@ -240,6 +240,8 @@ class UserProfile(Base):
     qualifications: Mapped[list | None] = mapped_column(JSON, nullable=True)
     project_experience: Mapped[str | None] = mapped_column(Text, nullable=True)
     architecture_experience: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 製作物リスト: [{name, type, description, tech_stack, is_ai, team_size, duration, repo_url}]
+    projects: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Sonnet 4.6が算出する実務力スコア
     tech_level_score: Mapped[float | None] = mapped_column(Float, nullable=True)
