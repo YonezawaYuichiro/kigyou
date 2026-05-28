@@ -14,6 +14,7 @@ dim[9]（開発環境）の証拠テキスト補強として使用する。
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,10 +26,23 @@ logger = logging.getLogger(__name__)
 
 _GITHUB_API = "https://api.github.com"
 _TIMEOUT = 10.0
-_HEADERS = {
-    "User-Agent": "GradMatchAI/4.0 (academic research)",
-    "Accept": "application/vnd.github.v3+json",
-}
+
+
+def _build_github_headers() -> dict[str, str]:
+    """GitHub APIヘッダーを生成する。GITHUB_TOKENがあれば認証付き（5000req/h）。"""
+    headers: dict[str, str] = {
+        "User-Agent": "GradMatchAI/4.0 (academic research)",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        logger.debug("GitHub API: 認証付きリクエスト（5000req/h）")
+    else:
+        logger.debug("GitHub API: 認証なし（60req/h）")
+    return headers
+
+
 # 180日以上更新なし = 非アクティブと判定
 _INACTIVE_DAYS = 180
 
@@ -106,7 +120,7 @@ def _find_org_name(company_name: str, official_url: str) -> str | None:
     for slug in candidates:
         try:
             url = f"{_GITHUB_API}/orgs/{slug}"
-            with httpx.Client(timeout=_TIMEOUT, headers=_HEADERS) as client:
+            with httpx.Client(timeout=_TIMEOUT, headers=_build_github_headers()) as client:
                 resp = client.get(url)
                 if resp.status_code == 200:
                     logger.debug("[github_org] %s → org_name=%s", company_name, slug)
@@ -127,7 +141,7 @@ def _fetch_org_repos(org_name: str) -> list[dict]:
     url = f"{_GITHUB_API}/orgs/{org_name}/repos"
     params = {"type": "public", "sort": "pushed", "per_page": 100}
     try:
-        with httpx.Client(timeout=_TIMEOUT, headers=_HEADERS) as client:
+        with httpx.Client(timeout=_TIMEOUT, headers=_build_github_headers()) as client:
             resp = client.get(url, params=params)
             resp.raise_for_status()
             return resp.json()

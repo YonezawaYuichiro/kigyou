@@ -82,8 +82,32 @@ def _days_since(iso_str: str) -> int | None:
         return None
 
 
+def _zenn_user_has_articles(slug: str) -> bool:
+    """ZennのAPIでslugが実際の投稿者として記事を持つか確認する。
+
+    /api/users/{slug} は公開されていないため、articles APIで取得した結果を
+    user.username照合で確認する。
+    """
+    try:
+        url = f"https://zenn.dev/api/articles?username={slug}&order=latest&count=5"
+        with httpx.Client(timeout=5.0, headers=_HEADERS) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return False
+            articles = resp.json().get("articles", [])
+            return any(
+                art.get("user", {}).get("username", "").lower() == slug.lower() for art in articles
+            )
+    except Exception:
+        return False
+
+
 def _fetch_zenn_articles(org_slug: str) -> BlogStats:
-    """Zenn Publication の記事統計を取得する。"""
+    """Zenn の記事統計を取得する。
+
+    注意: Zenn APIの `?username=` パラメータはフィルタが不完全なため、
+    取得した記事の user.username を照合して確実に当該ユーザーの記事のみカウントする。
+    """
     url = f"https://zenn.dev/api/articles?username={org_slug}&order=latest&count=50"
     try:
         with httpx.Client(timeout=_TIMEOUT, headers=_HEADERS) as client:
@@ -93,7 +117,13 @@ def _fetch_zenn_articles(org_slug: str) -> BlogStats:
     except Exception as e:
         return BlogStats(fetch_error=str(e))
 
-    articles = data.get("articles", [])
+    all_articles = data.get("articles", [])
+    # user.username が org_slug と一致する記事のみ対象（誤検知防止）
+    articles = [
+        art
+        for art in all_articles
+        if art.get("user", {}).get("username", "").lower() == org_slug.lower()
+    ]
     if not articles:
         return BlogStats(blog_url=f"https://zenn.dev/{org_slug}", platform="zenn")
 
@@ -203,13 +233,9 @@ def _guess_blog_url_from_hp(company_name: str, official_url: str) -> tuple[str, 
     for platform, slug in candidates:
         try:
             if platform == "zenn":
-                url = f"https://zenn.dev/api/articles?username={slug}&count=1"
-                with httpx.Client(timeout=5.0, headers=_HEADERS) as client:
-                    resp = client.get(url)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("articles"):
-                            return (platform, slug)
+                # 記事の user.username 照合でユーザー存在を確認（公開 users API がないため）
+                if _zenn_user_has_articles(slug):
+                    return (platform, slug)
             elif platform == "qiita":
                 url = f"https://qiita.com/api/v2/organizations/{slug}/items?per_page=1"
                 with httpx.Client(timeout=5.0, headers=_HEADERS) as client:
@@ -224,15 +250,66 @@ def _guess_blog_url_from_hp(company_name: str, official_url: str) -> tuple[str, 
     return None
 
 
+def _find_blog_url_via_gemini(company_name: str) -> tuple[str, str] | None:
+    """Gemini Google Searchで技術ブログURLを検出し (platform, slug) を返す。"""
+    import re
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        from backend.config import settings
+
+        if not settings.gemini_api_key:
+            return None
+
+        gclient = genai.Client(api_key=settings.gemini_api_key)
+        query = f"{company_name} 技術ブログ site:zenn.dev OR site:qiita.com エンジニア"
+        time.sleep(4)  # Gemini無料ティア: 15req/min制限対策
+        response = gclient.models.generate_content(
+            model=settings.gemini_model,
+            contents=query,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            ),
+        )
+        text = response.text or ""
+
+        # zenn.dev/{slug} パターン（api/articles/books/topics は除外）
+        zenn_match = re.search(r"zenn\.dev/(?:p/)?([a-zA-Z0-9_-]{3,})", text)
+        if zenn_match:
+            slug = zenn_match.group(1)
+            if slug not in {"api", "articles", "books", "topics", "dashboard"}:
+                # 実際に記事があるか確認
+                if _zenn_user_has_articles(slug):
+                    logger.info("[blog_analyzer] Gemini検出(zenn): %s → %s", company_name, slug)
+                    return ("zenn", slug)
+
+        # qiita.com/organizations/{org} パターン
+        qiita_org_match = re.search(r"qiita\.com/organizations/([a-zA-Z0-9_-]{2,})", text)
+        if qiita_org_match:
+            org_id = qiita_org_match.group(1)
+            logger.info("[blog_analyzer] Gemini検出(qiita): %s → %s", company_name, org_id)
+            return ("qiita", org_id)
+
+    except Exception as e:
+        logger.debug("[blog_analyzer] Gemini検索失敗 %s: %s", company_name, e)
+    return None
+
+
 def analyze_company_blog(company_name: str, official_url: str) -> BlogStats:
     """企業の技術ブログを自動検出して統計を返す。
 
-    1. HPドメインから Zenn/Qiita の slug を推測
-    2. 推測できない場合は BlogStats(fetch_error="ブログ未検出") を返す
+    1. HPドメインから Zenn/Qiita の slug を推測（高速・無料）
+    2. 失敗した場合は Gemini Google Search でURLを検出（有料・高精度）
+    3. 両方失敗したら BlogStats(fetch_error="ブログ未検出") を返す
     """
     logger.info("[blog_analyzer] %s を解析中...", company_name)
 
     result = _guess_blog_url_from_hp(company_name, official_url)
+    if result is None:
+        logger.debug("[blog_analyzer] %s: ドメイン推測失敗 → Gemini検索", company_name)
+        result = _find_blog_url_via_gemini(company_name)
     if result is None:
         logger.debug("[blog_analyzer] %s: ブログURL未検出", company_name)
         return BlogStats(fetch_error="ブログ未検出")
