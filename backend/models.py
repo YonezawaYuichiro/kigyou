@@ -187,6 +187,8 @@ class CompanyDimensions(Base):
     has_coding_test: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # current_engineer / hr_only / mixed / unknown
     interviewer_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # 採用難易度スコア（10次元外・realistic_score割引に使用）
+    hiring_difficulty_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # 開発環境 (dim[9])
     tech_modernity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -219,7 +221,7 @@ class CompanyVector(Base):
     company_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("company.id", ondelete="CASCADE"), unique=True, nullable=False
     )
-    # 10次元: [立地, ビジョン, BM, 財務, 業界, カルチャー, キャリア, WLB, 採用, 開発環境]
+    # 10次元(V4): [自社開発度, 新規事業, 技術鮮度, 安定性, 育成投資, カルチャー, キャリア, WLB, 採用評価, 開発環境]
     dim_scores = mapped_column(Vector(10), nullable=True)
     model_version: Mapped[str] = mapped_column(String(20), nullable=False, server_default="v2.0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

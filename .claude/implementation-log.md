@@ -2,6 +2,32 @@
 
 ---
 
+## 2026-05-28: V4 Phase A〜F — 10次元再定義・企業分析基盤整備・UI封印
+
+- **実装内容**:
+  - `backend/models.py` — CompanyDimensionsに `hiring_difficulty_score` 追加、CompanyVectorコメント更新
+  - `alembic/versions/b1c2d3e4f5a6_v4_add_hiring_difficulty.py` — マイグレーション
+  - `backend/seed/vector_builder.py` — 10次元を新卒エンジニア特化に全面再定義（v4.0）。立地をdim[0]から除外してhard_filterに一本化。自社開発度/新規事業/使用技術鮮度/事業安定性/育成投資/カルチャー/キャリア/WLB/選考技術評価/開発環境。`compute_hiring_difficulty()` 追加
+  - `backend/seed/priority_scorer.py` — **新規**: 50社選定スコアリング（大阪+自社開発+データギャップ）
+  - `backend/seed/blog_analyzer.py` — **新規**: Zenn/Qiita技術ブログ自動検出・定量化
+  - `backend/seed/github_org_analyzer.py` — **新規**: GitHub Organization解析（言語分布・活動度）
+  - `backend/seed/scoring_rubric.py` — **新規**: チェックリスト方式スコアリング定義（カルチャー/育成/若手裁量/開発環境）
+  - `backend/seed/dimensions_extractor.py` — `compute_objective_confidence_from_star()` 追加。Haiku自己申告→証拠充実度からの算術計算に変更
+  - `app.py` — V4封印モード（_V4_SEALED=True）。サイドバーを全10次元スライダー（0〜10整数・プリセット5種）に全面改修。企業一覧ブラウザ・比較機能・大阪デフォルト表示を新設
+
+- **設計判断**:
+  - 立地は10次元から除外してhard_filter（preferred_prefectures）に一本化。10次元はすべて「ユーザーが重みを変えたい軸」として再定義
+  - 技術発信活動（ブログ/GitHub）は独立次元にせず、データ収集後にdim[2]/dim[9]の証拠として活用
+  - hiring_difficulty_scoreは10次元の外に独立して realistic_score の割引計算に使用
+  - スライダー正規化後の値をsession_stateに戻さない（0〜10のまま維持）ことで操作性を改善
+  - blog_analyzer / github_org_analyzerはPhase E2（50社確定後）に実行予定
+
+- **動作確認**: ruff check ALL PASS（全9ファイル）
+
+- **残課題**: Phase E2（50社選定→データ再収集→ベクトル再計算）、Phase C/D のdimensions_extractor完全統合（現在は信頼度客観化のみ）
+
+---
+
 ## 2026-05-28: V3 UI改善・サイドバー統合・評価基準刷新（V3完了）
 
 - **実装内容**:

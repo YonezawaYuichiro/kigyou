@@ -16,17 +16,14 @@ import streamlit as st
 from anthropic import Anthropic
 from sqlalchemy import select
 
-from backend.api.intent_translator import translate_intent
 from backend.api.matching_engine import compute_matches
 from backend.api.profile_manager import (
     load_or_create_profile,
     update_dimension_weights,
-    update_hard_constraints,
 )
-from backend.api.scorer import calc_score, load_profile
 from backend.config import DATA_DIR, PROMPTS_DIR, settings
 from backend.database import get_session
-from backend.models import Company, CompanyMetrics
+from backend.models import Company
 
 
 @st.cache_resource
@@ -76,78 +73,84 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 _session_id: str = st.session_state["session_id"]
 
-# ─── サイドバー: V2クイック設定 ────────────────────────────────────────────
-# V2プロフィールをsession_stateにキャッシュ（毎描画でDB呼び出しを避ける）
-if "v2_profile_cache" not in st.session_state:
-    st.session_state["v2_profile_cache"] = load_or_create_profile(_session_id)
+# ─── サイドバー: V4 10次元重みスライダー ──────────────────────────────────
+# V4: 全10次元スライダー（0〜10整数）、正規化後の値をスライダーに反映しない
 
-_prof = st.session_state["v2_profile_cache"]
-_hard = _prof.hard_constraints or {}
-_dw = list(_prof.dimension_weights) if _prof.dimension_weights is not None else [0.1] * 10
-
-st.sidebar.header("クイック設定")
-
-# ── ハードフィルタ ──
-st.sidebar.subheader("絞り込み条件")
-_prefs_raw = st.sidebar.text_input(
-    "勤務地（カンマ区切り・空欄=全国）",
-    value=", ".join(_hard.get("preferred_prefectures", [])),
-)
-_max_ot_sb = st.sidebar.slider("残業上限（h/月）", 0, 80, int(_hard.get("max_overtime_hours", 30)))
-_remote_sb = st.sidebar.multiselect(
-    "リモートワーク",
-    ["full", "partial", "none"],
-    default=_hard.get("remote_work", ["full", "partial"]),
-    format_func={"full": "フルリモート", "partial": "一部リモート", "none": "出社のみ"}.get,
-)
-_ALL_CATS = ["自社開発", "SIer", "スタートアップ", "受託開発", "その他"]
-_cat_sb = st.sidebar.multiselect(
-    "企業カテゴリ（空欄=全て）",
-    _ALL_CATS,
-    default=[c for c in _hard.get("preferred_categories", []) if c in _ALL_CATS],
-)
-
-# ── 次元重みスライダー（5主要次元を個別制御、残り5次元は均等配分） ──
-st.sidebar.subheader("重み設定")
-_SB_DIMS = {0: "立地", 5: "カルチャー", 6: "キャリア成長", 7: "WLB", 9: "技術・開発環境"}
-_w_vals = {
-    idx: st.sidebar.slider(label, 0.0, 1.0, float(_dw[idx]) if len(_dw) > idx else 0.1, 0.05)
-    for idx, label in _SB_DIMS.items()
+_V4_DIM_NAMES = [
+    "自社開発度",
+    "新規事業・ビジョン",
+    "使用技術の鮮度",
+    "企業規模・安定性",
+    "エンジニア成長支援",
+    "社風・カルチャー",
+    "キャリア成長",
+    "WLB",
+    "選考の技術評価度",
+    "開発環境",
+]
+_V4_PRESETS: dict[str, list[int]] = {
+    "技術成長": [8, 6, 8, 3, 7, 5, 8, 4, 6, 9],
+    "WLB重視": [5, 4, 4, 5, 5, 7, 5, 10, 4, 4],
+    "安定志向": [5, 5, 4, 9, 6, 6, 5, 6, 5, 4],
+    "自社開発": [10, 8, 6, 3, 6, 7, 7, 5, 6, 7],
+    "均等": [5] * 10,
 }
-_remaining = max(0.0, 1.0 - sum(_w_vals.values()))
-_other_w = _remaining / 5
-_full_weights = [_other_w] * 10
-for _idx, _v in _w_vals.items():
-    _full_weights[_idx] = _v
-_total_w = sum(_full_weights) or 1.0
-_full_weights = [round(w / _total_w, 4) for w in _full_weights]
-st.sidebar.caption(f"主要5次元合計: {sum(_w_vals.values()):.2f} → 正規化済み")
 
-if st.sidebar.button("✅ 適用して再計算"):
-    _prefectures = [s.strip() for s in _prefs_raw.split(",") if s.strip()]
-    update_hard_constraints(
-        _session_id,
-        {
-            "max_overtime_hours": _max_ot_sb,
-            "remote_work": _remote_sb,
-            "preferred_prefectures": _prefectures,
-            "preferred_categories": _cat_sb,
-        },
+if "sidebar_raw_weights" not in st.session_state:
+    st.session_state["sidebar_raw_weights"] = [5] * 10
+
+st.sidebar.header("🎚️ 重み設定（0〜10）")
+
+# プリセットボタン（2列）
+_preset_cols = st.sidebar.columns(2)
+for _pi, (_pname, _pvals) in enumerate(_V4_PRESETS.items()):
+    if _preset_cols[_pi % 2].button(_pname, use_container_width=True, key=f"preset_{_pi}"):
+        st.session_state["sidebar_raw_weights"] = list(_pvals)
+        st.rerun()
+
+st.sidebar.divider()
+
+# 全10次元スライダー（正規化前の値をsession_stateで保持）
+_raw_weights: list[int] = []
+for _di, _dname in enumerate(_V4_DIM_NAMES):
+    _val = st.sidebar.slider(
+        _dname,
+        0,
+        10,
+        int(st.session_state["sidebar_raw_weights"][_di]),
+        step=1,
+        key=f"dim_slider_{_di}",
     )
-    update_dimension_weights(_session_id, _full_weights)
-    st.session_state.pop("v2_profile_cache", None)
+    _raw_weights.append(_val)
+
+_total_raw = sum(_raw_weights) or 10
+_normalized_weights = [round(v / _total_raw, 4) for v in _raw_weights]
+st.sidebar.caption(f"合計: {_total_raw} → 正規化して適用")
+
+if st.sidebar.button("✅ 適用して再計算", type="primary"):
+    update_dimension_weights(_session_id, _normalized_weights)
+    st.session_state["sidebar_raw_weights"] = list(_raw_weights)
     for _k in [k for k in st.session_state if k.startswith("v2_")]:
         del st.session_state[_k]
     st.rerun()
 
 st.sidebar.divider()
-st.sidebar.page_link("pages/1_profile_setup.py", label="📋 プロフィール詳細設定")
+
+# 表示絞り込み（立地はハードフィルタに一本化）
+st.sidebar.subheader("📍 表示絞り込み")
+_V4_SHOW_ALL = st.sidebar.checkbox("全国表示（開発用）", value=False)
+_V4_MIN_CONF = st.sidebar.slider("最低信頼度", 0.0, 1.0, 0.0, 0.05)
+
+# V2プロフィール（マッチング用・封印中は軽量利用）
+if "v2_profile_cache" not in st.session_state:
+    st.session_state["v2_profile_cache"] = load_or_create_profile(_session_id)
 
 
-# ─── メイン: 3タブ ───────────────────────────────────────────────────────
-tab_ideal, tab_realistic, tab_v1 = st.tabs(
-    ["🏆 理想企業（V2）", "🎯 受けるべき企業（V2）", "📊 従来スコアリング（V1）"]
-)
+# ─── メイン: V4 封印モード ────────────────────────────────────────────────
+# V4: マッチングフローを一時封印し「企業分析」に集中する。
+# _V4_SEALED = False に戻すと全タブが復活する。
+_V4_SEALED = True
+(tab_companies,) = st.tabs(["🏢 企業分析"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -537,356 +540,191 @@ def _render_v2_detail(name: str, rows: list[dict], dimension_weights: list[float
         _render_xai_panel(detail, dimension_weights)
 
 
-# ─── タブ1: 理想企業 ───────────────────────────────────────────────────────
-with tab_ideal:
-    tech_level = st.session_state.get("v2_tech_level", 0.5)
-    col_score, col_link = st.columns([3, 1])
-    with col_score:
-        st.caption(f"あなたの実務力スコア: **{tech_level:.2f}** / 1.0")
-    with col_link:
-        st.page_link("pages/1_profile_setup.py", label="👤 プロフィール設定で更新")
-
-    _render_market_position(tech_level)
-
-    # ─── 意図翻訳エンジン ───────────────────────────────────────────────────
-    with st.expander("💬 自然言語で重みを調整（意図翻訳）"):
-        st.caption(
-            "理想の就職先を自由に書いてください。Sonnet 4.6 が10次元重みに変換してマッチングに反映します。"
-        )
-        intent_text = st.text_area(
-            "理想の就職先（自由記述）",
-            value=st.session_state.get("intent_text", ""),
-            height=80,
-            placeholder="例: AIを使った開発がしたい。若手でも裁量が大きく、残業が少ない会社が良い。",
-            label_visibility="collapsed",
-        )
-        col_tr, col_apply, col_clear = st.columns([2, 2, 1])
-        with col_tr:
-            translate_btn = st.button("🤖 重みを提案", key="translate_btn")
-        with col_apply:
-            apply_btn = st.button(
-                "✅ この重みでマッチング",
-                key="apply_intent",
-                disabled="intent_weights" not in st.session_state,
-            )
-        with col_clear:
-            if st.button("✕ リセット", key="clear_intent"):
-                for k in ["intent_weights", "intent_explanation", "intent_text"]:
-                    st.session_state.pop(k, None)
-                for k in [k for k in st.session_state if k.startswith("v2_")]:
-                    del st.session_state[k]
-                st.rerun()
-
-        if translate_btn and intent_text.strip():
-            base_dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
-            with st.spinner("Sonnet 4.6 が重みを計算中..."):
-                new_weights, explanation = translate_intent(intent_text, base_dw)
-            st.session_state["intent_weights"] = new_weights
-            st.session_state["intent_explanation"] = explanation
-            st.session_state["intent_text"] = intent_text
-
-        if "intent_weights" in st.session_state:
-            _DIM_LABELS_SHORT = [
-                "立地",
-                "ビジョン",
-                "BM",
-                "財務",
-                "トレンド",
-                "カルチャー",
-                "キャリア",
-                "WLB",
-                "採用",
-                "開発環境",
-            ]
-            iw = st.session_state["intent_weights"]
-            iw_df = pd.DataFrame({"提案重み": iw}, index=_DIM_LABELS_SHORT)
-            st.bar_chart(iw_df, horizontal=True, height=200)
-            if st.session_state.get("intent_explanation"):
-                st.caption(f"Sonnetの解釈: {st.session_state['intent_explanation']}")
-
-        if apply_btn and "intent_weights" in st.session_state:
-            with st.spinner("プロフィールに適用中..."):
-                update_dimension_weights(_session_id, st.session_state["intent_weights"])
-            for k in [k for k in st.session_state if k.startswith("v2_")]:
-                del st.session_state[k]
-            st.success("重みを適用しました。マッチングを再実行します。")
-            st.rerun()
-
-    col_refresh, col_info = st.columns([1, 5])
-    with col_refresh:
-        if st.button("🔄 再計算", key="refresh_ideal"):
-            for k in [k for k in st.session_state if k.startswith("v2_")]:
-                del st.session_state[k]
-            st.rerun()
-
-    matches = _run_v2_matches()
-    ideal_rows = matches.get("ideal", [])
-    st.subheader(f"理想企業ランキング: {len(ideal_rows)} 社")
-
-    selected_ideal = _render_v2_table(ideal_rows, "ideal_score", "理想スコア")
-    if selected_ideal:
-        st.session_state["v2_selected_ideal"] = selected_ideal
-
-    dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
-    selected = st.session_state.get("v2_selected_ideal")
-    if selected:
-        st.divider()
-        _render_v2_detail(selected, ideal_rows, dw)
-
-# ─── タブ2: 受けるべき企業 ─────────────────────────────────────────────────
-with tab_realistic:
-    matches = _run_v2_matches()
-    realistic_rows = matches.get("realistic", [])
-    st.subheader(f"受けるべき企業ランキング: {len(realistic_rows)} 社")
-    st.caption("理想スコアを実務力スコアとの差（技術レベルギャップ）で補正したランキングです。")
-
-    selected_real = _render_v2_table(realistic_rows, "realistic_score", "現実的スコア")
-    if selected_real:
-        st.session_state["v2_selected_real"] = selected_real
-
-    dw = st.session_state.get("v2_dimension_weights", [0.1] * 10)
-    selected = st.session_state.get("v2_selected_real")
-    if selected:
-        st.divider()
-        _render_v2_detail(selected, realistic_rows, dw)
+# ─── 企業一覧ブラウザ（V4メイン機能） ─────────────────────────────────────
 
 
-@st.cache_data(ttl=300)
-def _fetch_companies() -> list[dict]:
-    rows = []
+def _load_companies_for_browser(osaka_only: bool, min_confidence: float) -> list[dict]:
+    """企業一覧をDBから取得してフィルタリングする。"""
     with get_session() as session:
-        companies = session.scalars(select(Company)).all()
-        for c in companies:
-            m = c.metrics
-            rows.append(
+        from sqlalchemy.orm import selectinload
+
+        companies = (
+            session.execute(
+                select(Company).options(
+                    selectinload(Company.metrics),
+                    selectinload(Company.dimensions),
+                    selectinload(Company.vector),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        results = []
+        for company in companies:
+            dims = company.dimensions
+            metrics = company.metrics
+            vec = company.vector
+            conf = dims.overall_confidence if dims else None
+            if osaka_only and company.hq_prefecture not in ("大阪府", "京都府", "兵庫県"):
+                continue
+            if min_confidence > 0 and (conf is None or conf < min_confidence):
+                continue
+            results.append(
                 {
-                    "id": str(c.id),
-                    "name": c.name,
-                    "official_url": c.official_url,
-                    "hq_prefecture": c.hq_prefecture,
-                    "estimated_category": c.estimated_category,
-                    "tech_stack": list(c.tech_stack or []),
-                    "hiring_roles": list(c.hiring_roles or []),
-                    "llm_confidence": c.llm_confidence,
-                    "openwork_score": m.openwork_score if m else None,
-                    "avg_overtime_hours": m.avg_overtime_hours if m else None,
-                    "paid_leave_rate": m.paid_leave_rate if m else None,
-                    "avg_annual_salary": m.avg_annual_salary if m else None,
-                    "openwork_review_count": m.openwork_review_count if m else None,
-                    "openwork_url": m.openwork_url if m else None,
-                    "employee_count": m.employee_count if m else None,
-                    "average_age": m.average_age if m else None,
-                    "is_listed": m.is_listed if m else None,
-                    "founded_year": m.founded_year if m else None,
-                    "green_url": m.green_url if m else None,
-                    "ow_score_growth": m.ow_score_growth if m else None,
-                    "ow_score_morale": m.ow_score_morale if m else None,
-                    "ow_score_openness": m.ow_score_openness if m else None,
-                    "remote_work_policy": m.remote_work_policy if m else None,
+                    "company_id": str(company.id),
+                    "name": company.name,
+                    "official_url": company.official_url,
+                    "hq_prefecture": company.hq_prefecture,
+                    "estimated_category": company.estimated_category,
+                    "tech_stack": list(company.tech_stack or []),
+                    "overall_confidence": conf,
+                    "openwork_score": metrics.openwork_score if metrics else None,
+                    "avg_overtime_hours": metrics.avg_overtime_hours if metrics else None,
+                    "avg_annual_salary": metrics.avg_annual_salary if metrics else None,
+                    "employee_count": metrics.employee_count if metrics else None,
+                    "remote_work_policy": metrics.remote_work_policy if metrics else None,
+                    "openwork_url": metrics.openwork_url if metrics else None,
+                    "green_url": metrics.green_url if metrics else None,
+                    "is_listed": metrics.is_listed if metrics else None,
+                    "founded_year": metrics.founded_year if metrics else None,
+                    "ow_score_morale": metrics.ow_score_morale if metrics else None,
+                    "ow_score_openness": metrics.ow_score_openness if metrics else None,
+                    "ow_score_growth": metrics.ow_score_growth if metrics else None,
+                    # CompanyDimensions
+                    "psychological_safety_score": dims.psychological_safety_score if dims else None,
+                    "psychological_safety_evidence": dims.psychological_safety_evidence
+                    if dims
+                    else None,
+                    "junior_authority_score": dims.junior_authority_score if dims else None,
+                    "junior_authority_evidence": dims.junior_authority_evidence if dims else None,
+                    "tech_env_evidence": dims.tech_env_evidence if dims else None,
+                    "new_biz_policy_evidence": dims.new_biz_policy_evidence if dims else None,
+                    "has_coding_test": dims.has_coding_test if dims else None,
+                    "interviewer_type": dims.interviewer_type if dims else None,
+                    "skill_support_score": dims.skill_support_score if dims else None,
+                    "skill_support_items": list(dims.skill_support_items or []) if dims else None,
+                    "evaluation_score": dims.evaluation_score if dims else None,
+                    "evaluation_system_type": dims.evaluation_system_type if dims else None,
+                    "career_track_diversity": dims.career_track_diversity if dims else None,
+                    "tech_modernity_score": dims.tech_modernity_score if dims else None,
+                    "infra_cloud_score": dims.infra_cloud_score if dims else None,
+                    "cicd_maturity_score": dims.cicd_maturity_score if dims else None,
+                    "tech_debt_culture_score": dims.tech_debt_culture_score if dims else None,
+                    "competitive_advantage_score": dims.competitive_advantage_score
+                    if dims
+                    else None,
+                    "competitive_advantage_evidence": dims.competitive_advantage_evidence
+                    if dims
+                    else None,
+                    "hiring_difficulty_score": dims.hiring_difficulty_score if dims else None,
+                    "megatrend_alignment": list(dims.megatrend_alignment or []) if dims else None,
+                    # CompanyVector
+                    "dim_scores": list(vec.dim_scores)
+                    if vec and vec.dim_scores is not None
+                    else None,
                 }
             )
-    return rows
+    results.sort(key=lambda x: x["overall_confidence"] or 0.0, reverse=True)
+    return results
 
 
-# ─── タブ3: 従来スコアリング（V1） ────────────────────────────────────────
-with tab_v1:
-    # V1設定（従来のサイドバー項目をタブ内エクスパンダーに移動）
-    with st.expander("⚙️ V1スコアリング設定", expanded=False):
-        _v1_profile = load_profile(PROFILE_PATH)
-        _v1_col1, _v1_col2 = st.columns(2)
-        with _v1_col1:
-            _w_tech = st.slider(
-                "技術成長性",
-                0.0,
-                1.0,
-                float(_v1_profile["weights"]["tech_growth"]),
-                0.05,
-                key="v1_w_tech",
-            )
-            _w_wlb = st.slider(
-                "WLB", 0.0, 1.0, float(_v1_profile["weights"]["wlb"]), 0.05, key="v1_w_wlb"
-            )
-            _w_size = st.slider(
-                "企業規模",
-                0.0,
-                1.0,
-                float(_v1_profile["weights"]["company_size"]),
-                0.05,
-                key="v1_w_size",
-            )
-        with _v1_col2:
-            _w_self = st.slider(
-                "自社開発度",
-                0.0,
-                1.0,
-                float(_v1_profile["weights"]["self_developed"]),
-                0.05,
-                key="v1_w_self",
-            )
-            _w_loc = st.slider(
-                "立地", 0.0, 1.0, float(_v1_profile["weights"]["location"]), 0.05, key="v1_w_loc"
-            )
-        _v1_total = _w_tech + _w_wlb + _w_size + _w_self + _w_loc or 1.0
-        _v1_norm = {
-            "tech_growth": _w_tech / _v1_total,
-            "wlb": _w_wlb / _v1_total,
-            "company_size": _w_size / _v1_total,
-            "self_developed": _w_self / _v1_total,
-            "location": _w_loc / _v1_total,
+def _render_comparison_chart(names: list[str], rows: list[dict]) -> None:
+    """選択した複数企業の10次元スコアを並べて比較する。"""
+    selected = [r for r in rows if r["name"] in names]
+    if not selected:
+        return
+    dim_names_v4 = [
+        "自社開発度",
+        "新規事業",
+        "使用技術",
+        "企業規模",
+        "育成支援",
+        "カルチャー",
+        "キャリア",
+        "WLB",
+        "選考評価",
+        "開発環境",
+    ]
+    comp_data: dict[str, list] = {}
+    for c in selected:
+        scores = c.get("dim_scores")
+        comp_data[c["name"]] = (
+            [round(s, 3) for s in scores] if scores and len(scores) == 10 else [0.0] * 10
+        )
+    comp_df = pd.DataFrame(comp_data, index=dim_names_v4)
+    st.bar_chart(comp_df, height=300, horizontal=True)
+    meta_rows = [
+        {
+            "企業名": c["name"],
+            "信頼度": round(c["overall_confidence"] or 0, 2),
+            "OW評価": c["openwork_score"] or "N/A",
+            "残業h/月": c["avg_overtime_hours"] or "N/A",
+            "採用難易度": round(c["hiring_difficulty_score"] or 0, 2),
         }
-        st.caption(f"合計 {_v1_total:.2f} → 正規化済み")
-        _v1_c1, _v1_c2 = st.columns(2)
-        with _v1_c1:
-            apply_filters = st.toggle("ハードフィルターを適用", value=True, key="v1_apply_filters")
-            min_coverage = st.slider("データ充実度（最低項目数）", 0, 5, 0, key="v1_min_coverage")
-        with _v1_c2:
-            _v1_max_ot = st.number_input(
-                "残業上限 (h/月)",
-                0,
-                80,
-                int(_v1_profile["hard_filters"].get("max_overtime_hours", 30)),
-                key="v1_max_ot",
+        for c in selected
+    ]
+    st.dataframe(pd.DataFrame(meta_rows), hide_index=True, use_container_width=True)
+
+
+def _render_company_browser() -> None:
+    """V4メイン: 企業一覧ブラウザ + 選択詳細 + 比較機能。"""
+    if "company_browser_cache" not in st.session_state:
+        with st.spinner("企業データを読み込み中..."):
+            st.session_state["company_browser_cache"] = _load_companies_for_browser(
+                osaka_only=not _V4_SHOW_ALL,
+                min_confidence=_V4_MIN_CONF,
             )
-            _v1_min_score = st.number_input(
-                "OpenWork スコア下限",
-                0.0,
-                5.0,
-                float(_v1_profile["hard_filters"].get("min_openwork_score", 3.0)),
-                step=0.1,
-                key="v1_min_score",
-            )
-        _v1_req_raw = st.text_input(
-            "必須スキル（カンマ区切り）",
-            value=", ".join(_v1_profile.get("required_skills", [])),
-            key="v1_req_skills",
+    rows: list[dict] = st.session_state["company_browser_cache"]
+
+    col_search, col_cat, col_sort = st.columns([3, 2, 2])
+    with col_search:
+        search_q = st.text_input("🔍 企業名・技術スタック検索", "")
+    with col_cat:
+        cat_filter = st.multiselect(
+            "カテゴリ絞り込み",
+            ["自社開発", "SIer", "スタートアップ", "受託開発", "その他"],
+            default=[],
         )
-        _v1_bonus_raw = st.text_input(
-            "ボーナススキル（カンマ区切り）",
-            value=", ".join(_v1_profile.get("bonus_skills", [])),
-            key="v1_bonus_skills",
-        )
-        _v1_prefs_raw = st.text_input(
-            "希望都道府県（カンマ区切り）",
-            value=", ".join(_v1_profile.get("preferred_prefectures", [])),
-            key="v1_prefs",
-        )
+    with col_sort:
+        sort_by = st.selectbox("並び替え", ["信頼度", "OpenWork評価", "残業少ない順"])
 
-    active_profile = {
-        **_v1_profile,
-        "weights": _v1_norm,
-        "hard_filters": {
-            "max_overtime_hours": _v1_max_ot if apply_filters else None,
-            "min_openwork_score": _v1_min_score if apply_filters else None,
-        },
-        "required_skills": [s.strip() for s in _v1_req_raw.split(",") if s.strip()],
-        "bonus_skills": [s.strip() for s in _v1_bonus_raw.split(",") if s.strip()],
-        "preferred_prefectures": [s.strip() for s in _v1_prefs_raw.split(",") if s.strip()],
-        "qualifications": _v1_profile.get("qualifications", []),
-    }
-
-    raw_rows = _fetch_companies()
-
-    results = []
-    for r in raw_rows:
-
-        class _C:  # noqa: N801
-            pass
-
-        c = _C()
-        c.tech_stack = r["tech_stack"]
-        c.estimated_category = r["estimated_category"]
-        c.hq_prefecture = r["hq_prefecture"]
-
-        m: CompanyMetrics | None = None
-        if (
-            r["openwork_score"] is not None
-            or r["avg_overtime_hours"] is not None
-            or r["employee_count"] is not None
-        ):
-            m = _C()  # type: ignore[assignment]
-            m.openwork_score = r["openwork_score"]  # type: ignore[union-attr]
-            m.avg_overtime_hours = r["avg_overtime_hours"]  # type: ignore[union-attr]
-            m.paid_leave_rate = r["paid_leave_rate"]  # type: ignore[union-attr]
-            m.openwork_review_count = r["openwork_review_count"]  # type: ignore[union-attr]
-            m.employee_count = r["employee_count"]  # type: ignore[union-attr]
-            m.ow_score_growth = r["ow_score_growth"]  # type: ignore[union-attr]
-            m.ow_score_morale = r["ow_score_morale"]  # type: ignore[union-attr]
-            m.ow_score_openness = r["ow_score_openness"]  # type: ignore[union-attr]
-            m.remote_work_policy = r["remote_work_policy"]  # type: ignore[union-attr]
-
-        if apply_filters:
-            filters = active_profile["hard_filters"]
-            if filters.get("max_overtime_hours") and r["avg_overtime_hours"] is not None:
-                if r["avg_overtime_hours"] > filters["max_overtime_hours"]:
-                    continue
-            if filters.get("min_openwork_score") and r["openwork_score"] is not None:
-                if r["openwork_score"] < filters["min_openwork_score"]:
-                    continue
-
-        score_result = calc_score(c, m, active_profile)  # type: ignore[arg-type]
-        results.append(
-            {
-                **r,
-                "score": score_result["total"],
-                "axes": score_result["axes"],
-                "data_coverage": score_result["data_coverage"],
-            }
-        )
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    if min_coverage > 0:
-        results = [r for r in results if r["data_coverage"] >= min_coverage]
-
-    header_col, search_col = st.columns([2, 3])
-    with header_col:
-        st.subheader(f"マッチング結果: {len(results)} 社")
-    with search_col:
-        search_query = st.text_input(
-            "🔍 企業名で絞り込み", placeholder="例: サイボウズ", label_visibility="collapsed"
-        )
-
-    filtered = (
-        [r for r in results if search_query.lower() in r["name"].lower()]
-        if search_query
-        else results
-    )
-
-    df_src = pd.DataFrame(filtered)
-    df = (
-        df_src[
-            [
-                "name",
-                "score",
-                "data_coverage",
-                "estimated_category",
-                "hq_prefecture",
-                "openwork_score",
-                "avg_overtime_hours",
-                "avg_annual_salary",
-                "employee_count",
-                "llm_confidence",
-            ]
-        ].copy()
-        if not df_src.empty
-        else pd.DataFrame()
-    )
-    if not df.empty:
-        for col in ["openwork_score", "avg_overtime_hours", "avg_annual_salary", "employee_count"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["data_coverage"] = df["data_coverage"].apply(lambda n: "★" * int(n) + "☆" * (5 - int(n)))
-        df.columns = [
-            "企業名",
-            "マッチスコア",
-            "充実度",
-            "カテゴリ",
-            "都道府県",
-            "OW評価",
-            "残業h",
-            "年収(万)",
-            "従業員数",
-            "信頼度",
+    filtered = rows
+    if search_q:
+        q = search_q.lower()
+        filtered = [
+            r
+            for r in filtered
+            if q in r["name"].lower() or any(q in t.lower() for t in r["tech_stack"])
         ]
+    if cat_filter:
+        filtered = [r for r in filtered if r["estimated_category"] in cat_filter]
+    if sort_by == "OpenWork評価":
+        filtered = sorted(filtered, key=lambda x: x["openwork_score"] or 0, reverse=True)
+    elif sort_by == "残業少ない順":
+        filtered = sorted(filtered, key=lambda x: x["avg_overtime_hours"] or 999)
 
+    st.caption(f"表示: **{len(filtered)}社** / 全{len(rows)}社")
+
+    with st.expander("📊 企業比較（2〜3社選択）"):
+        compare_names = st.multiselect(
+            "比較する企業", [r["name"] for r in filtered], max_selections=3
+        )
+        if len(compare_names) >= 2:
+            _render_comparison_chart(compare_names, filtered)
+
+    df = pd.DataFrame(
+        [
+            {
+                "企業名": r["name"],
+                "都道府県": r["hq_prefecture"],
+                "カテゴリ": r["estimated_category"],
+                "信頼度": round(r["overall_confidence"] or 0, 2),
+                "OW評価": r["openwork_score"] or "",
+                "残業h": r["avg_overtime_hours"] or "",
+            }
+            for r in filtered
+        ]
+    )
     event = st.dataframe(
         df,
         use_container_width=True,
@@ -894,140 +732,19 @@ with tab_v1:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "マッチスコア": st.column_config.ProgressColumn(
-                min_value=0, max_value=1, format="%.3f"
-            ),
-            "OW評価": st.column_config.NumberColumn(format="%.2f ★"),
-            "残業h": st.column_config.NumberColumn(format="%.1f h"),
-            "年収(万)": st.column_config.NumberColumn(format="%d 万円"),
-            "従業員数": st.column_config.NumberColumn(format="%d 名"),
+            "信頼度": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f"),
         },
     )
+    selected_idxs = event.selection.rows if event and event.selection else []
+    if selected_idxs:
+        selected_name = filtered[selected_idxs[0]]["name"]
+        _render_v2_detail(selected_name, filtered, _normalized_weights)
 
-    selected_rows = event.selection.rows if event and event.selection else []
-    if selected_rows and filtered:
-        st.session_state["selected_company"] = filtered[selected_rows[0]]["name"]
+    if st.button("🔄 データ再読み込み"):
+        st.session_state.pop("company_browser_cache", None)
+        st.rerun()
 
-    with st.expander("企業を手動追加"):
-        with st.form("manual_add_form"):
-            url_input = st.text_input("企業のURL（例: https://hutzper.com/）")
-            submitted = st.form_submit_button("追加")
-        if submitted and url_input.strip():
-            import contextlib
-            import io
 
-            from backend.seed.manual_add import add_companies
-
-            buf = io.StringIO()
-            with st.spinner("追加中..."):
-                try:
-                    with contextlib.redirect_stdout(buf):
-                        add_companies([url_input.strip()])
-                    st.success(buf.getvalue())
-                    _fetch_companies.clear()
-                except Exception as e:
-                    st.error(f"追加失敗: {e}")
-
-    st.divider()
-    selected_name = st.session_state.get("selected_company")
-    if selected_name and not any(r["name"] == selected_name for r in results):
-        selected_name = None
-
-    if selected_name:
-        st.subheader(f"企業詳細: {selected_name}")
-        detail = next(r for r in results if r["name"] == selected_name)
-
-        _axis_labels = {
-            "tech_growth": "技術成長性",
-            "wlb": "WLB",
-            "company_size": "企業規模",
-            "self_developed": "自社開発度",
-            "location": "立地",
-        }
-        axes = detail["axes"]
-        ax_df = pd.DataFrame(
-            {"スコア": [axes[k] for k in _axis_labels]},
-            index=list(_axis_labels.values()),
-        )
-        cov = detail["data_coverage"]
-        detail_col, chart_col = st.columns([2, 3])
-        with detail_col:
-            st.metric("マッチスコア", f"{detail['score']:.3f}")
-            st.caption(f"データ充実度: {'★' * cov}{'☆' * (5 - cov)} ({cov}/5項目)")
-        with chart_col:
-            st.bar_chart(ax_df, horizontal=True, height=200)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("OpenWork 評価", f"{detail['openwork_score'] or 'N/A'}")
-            st.metric("従業員数", f"{detail['employee_count'] or 'N/A'} 名")
-        with col2:
-            st.metric("残業時間", f"{detail['avg_overtime_hours'] or 'N/A'} h/月")
-            st.metric("平均年収", f"{detail['avg_annual_salary'] or 'N/A'} 万円")
-            st.metric("平均年齢", f"{detail['average_age'] or 'N/A'} 歳")
-        with col3:
-            st.metric("カテゴリ", detail["estimated_category"])
-            st.metric("所在地", detail["hq_prefecture"])
-            listed_label = (
-                "上場"
-                if detail["is_listed"]
-                else ("非上場" if detail["is_listed"] is False else "N/A")
-            )
-            st.metric("上場区分", listed_label)
-
-        founded = detail.get("founded_year")
-        st.markdown(
-            f"**設立年**: {founded or 'N/A'}年　**技術スタック**: {', '.join(detail['tech_stack']) or 'N/A'}"
-        )
-
-        links = []
-        if detail["official_url"]:
-            links.append(f"[公式サイト]({detail['official_url']})")
-        if detail["openwork_url"]:
-            links.append(f"[OpenWork]({detail['openwork_url']})")
-        if detail.get("green_url"):
-            links.append(f"[Green]({detail['green_url']})")
-        if links:
-            st.markdown("  |  ".join(links))
-
-        st.divider()
-        st.subheader("就職分析")
-        cache_key = f"entry_analysis_{detail['name']}"
-        if cache_key not in st.session_state:
-            st.session_state[cache_key] = None
-
-        if st.button("🔍 就職分析を実行（Claude Haiku）"):
-            with st.spinner("分析中..."):
-                try:
-                    result = _run_entry_analysis(detail, active_profile)
-                    if result is None:
-                        st.error(
-                            "分析失敗: LLMの応答をJSONとして解析できませんでした。再度お試しください。"
-                        )
-                    else:
-                        st.session_state[cache_key] = result
-                except Exception as e:
-                    st.error(f"分析失敗: {e}")
-
-        analysis = st.session_state.get(cache_key)
-        if analysis:
-            diff_color = {"低": "green", "中": "orange", "高": "red"}.get(
-                analysis.get("difficulty", ""), "gray"
-            )
-            st.markdown(
-                f"**就職難易度**: :{diff_color}[{analysis['difficulty']}]　{analysis['difficulty_reason']}"
-            )
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**重要スキル**")
-                for s in analysis.get("required_skills", []):
-                    st.markdown(f"- {s}")
-            with col_b:
-                st.markdown("**スキルギャップ**")
-                gaps = analysis.get("skill_gap", [])
-                if gaps:
-                    for s in gaps:
-                        st.markdown(f"- ⚠️ {s}")
-                else:
-                    st.markdown("✅ ギャップなし")
-            st.info(analysis.get("advice", ""))
+# ─── タブ: 企業分析 ───────────────────────────────────────────────────────
+with tab_companies:
+    _render_company_browser()

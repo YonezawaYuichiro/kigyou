@@ -415,6 +415,42 @@ def _extract_category(
         return {}, {}, 0.0
 
 
+def compute_objective_confidence_from_star(
+    all_star: dict,
+    categories_with_data: int,
+    blog_article_count: int = 0,
+    github_repo_count: int = 0,
+) -> float:
+    """Haiku自己申告ではなく証拠の充実度から信頼度を算術計算する（Phase D）。
+
+    Args:
+        all_star:             抽出した★項目の辞書
+        categories_with_data: Haiku抽出が成功したカテゴリ数（最大9）
+        blog_article_count:   技術ブログの直近1年記事数（Phase B後に使用）
+        github_repo_count:    GitHub公開リポジトリ数（Phase B後に使用）
+    """
+    evidence_keys = [
+        "psychological_safety_evidence",
+        "junior_authority_evidence",
+        "tech_env_evidence",
+        "competitive_advantage_evidence",
+        "new_biz_policy_evidence",
+        "rd_ratio_evidence",
+    ]
+    evidence_texts = [str(all_star.get(k) or "") for k in evidence_keys]
+    # 60文字以上の証拠テキストを「充実」と判定
+    evidence_richness = sum(min(1.0, len(e) / 60.0) for e in evidence_texts if e) / len(
+        evidence_keys
+    )
+    # 成功したカテゴリ数（最大9）をソースの多様性として使用
+    source_diversity = min(1.0, categories_with_data / 9.0)
+    # Phase B で取得したブログ・GitHub ボーナス
+    external_bonus = (0.10 if blog_article_count > 0 else 0.0) + (
+        0.10 if github_repo_count > 0 else 0.0
+    )
+    return round(min(1.0, evidence_richness * 0.50 + source_diversity * 0.40 + external_bonus), 3)
+
+
 def _upsert_dimensions(
     company_id: str | uuid.UUID,
     dims: dict,
@@ -549,7 +585,10 @@ def _process_single_company(company_id: str, name: str, url: str | None) -> None
             except Exception as e:
                 logger.warning("%s [%s] エラー: %s", name, cat, e)
 
-    overall_conf = round(sum(confidences) / len(confidences), 3) if confidences else 0.0
+    # Haiku自己申告の平均ではなく証拠充実度から算術計算（Phase D）
+    overall_conf = compute_objective_confidence_from_star(
+        all_star, categories_with_data=len(confidences)
+    )
     _upsert_dimensions(company_id, all_star, [url or ""], overall_conf)
     _upsert_circle_fields(company_id, all_circle)
     logger.info("  ✓ %s overall_confidence=%.2f ○件数=%d件", name, overall_conf, len(all_circle))
