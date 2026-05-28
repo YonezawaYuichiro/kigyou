@@ -2,6 +2,25 @@
 
 ---
 
+## 2026-05-28: V3 Phase 5 — GitHub解析
+
+- **実装内容**:
+  - `backend/api/github_analyzer.py` — 新規作成。GitHub API（認証不要）で公開リポジトリを解析し `project_complexity_score`・使用言語・commit頻度・OSSコントリビュートを定量化
+  - `backend/api/profile_manager.py` — `_assess_tech_level()` に `github_summary` 引数追加（プロンプトに追加セクションとして挿入）、`save_profile()` に同パラメータ追加
+  - `pages/1_profile_setup.py` — Step 1 に GitHub URL 入力欄 + 「🔍 解析」ボタンを追加。Step 4 の保存時に `github_summary` を渡す
+
+- **設計判断**:
+  - DB カラム追加なし（GitHub URL は session_state のみに保持）。Phase 5 の目的はttech_level精度向上なので URL の永続化は不要と判断
+  - GitHub API は最大 2 リクエスト（repos + events）に制限し、レート制限 60req/h に配慮
+  - 解析エラーは例外を raise せず `error` キーで返す → UI が graceful に表示
+  - `project_complexity_score` はスター数（log scale）・言語数・複雑トピック・リポジトリ規模の加算方式
+
+- **動作確認**: ruff check ALL PASS、pytest 26 passed
+
+- **残課題**: V3 Phase 6（FastAPI化）
+
+---
+
 ## 2026-05-28: V3 Phase 4 — 意図翻訳エンジン
 
 - **実装内容**:

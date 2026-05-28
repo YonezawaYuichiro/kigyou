@@ -30,7 +30,7 @@ _LEVEL_ASSESSMENT_PROMPT = """\
 スキル: {skills}
 資格: {qualifications}
 個人開発・インターン経験:
-{project_experience}
+{project_experience}{github_section}
 
 【評価基準】
 0.0-0.2: プログラミング初学者（Hello World程度）
@@ -44,15 +44,20 @@ JSONのみ出力:
 
 
 def _assess_tech_level(
-    skills: list[str], qualifications: list[str], project_experience: str
+    skills: list[str],
+    qualifications: list[str],
+    project_experience: str,
+    github_summary: str | None = None,
 ) -> tuple[float, str]:
     """Sonnet 4.6 でユーザーの実務力スコアを算出する。失敗時は (0.5, "") を返す。"""
     try:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        github_section = f"\nGitHub活動:\n{github_summary}" if github_summary else ""
         prompt = _LEVEL_ASSESSMENT_PROMPT.format(
             skills=", ".join(skills) or "未入力",
             qualifications=", ".join(qualifications) or "なし",
             project_experience=project_experience or "未入力",
+            github_section=github_section,
         )
         response = client.messages.create(
             model=settings.sonnet_model,
@@ -212,11 +217,14 @@ def save_profile(
     mbti: str | None = None,
     eval_preference: str | None = None,
     psych_safety_importance: float | None = None,
+    github_summary: str | None = None,
     recompute_level: bool = True,
 ) -> UserProfile:
     """プロフィールをDBにupsertする。recompute_level=True なら Sonnet で tech_level_score を再算出。"""
     if recompute_level:
-        tech_score, rationale = _assess_tech_level(tech_skills, qualifications, project_experience)
+        tech_score, rationale = _assess_tech_level(
+            tech_skills, qualifications, project_experience, github_summary=github_summary
+        )
     else:
         tech_score, rationale = 0.5, ""
 

@@ -1,7 +1,7 @@
 """プロフィール設定ウィザード（V3）。
 
 4ステップでユーザーの実力・条件を入力し DB に保存する。
-  Step 1: スキル・経験入力
+  Step 1: スキル・経験入力（GitHub URL → 自動解析）
   Step 2: 志望軸（業界・職種・開発フェーズ・希望年収）
   Step 3: 勤務条件（絶対条件 / 希望条件）
   Step 4: 確認・保存 → Sonnet 4.6 で tech_level_score 算出
@@ -11,6 +11,7 @@ import uuid
 
 import streamlit as st
 
+from backend.api.github_analyzer import analyze_github
 from backend.api.profile_manager import load_or_create_profile, save_profile
 
 st.set_page_config(page_title="プロフィール設定 | GradMatch-AI", page_icon="👤", layout="centered")
@@ -67,7 +68,7 @@ if step == 1:
     project_exp = st.text_area(
         "個人開発・インターン経験（自由記述）",
         value=profile.project_experience or "",
-        height=200,
+        height=180,
         placeholder=(
             "例:\n"
             "・Djangoでポートフォリオサイトを個人開発（AWS EC2 + RDS 構成）\n"
@@ -75,6 +76,42 @@ if step == 1:
             "・PyTorchで画像分類モデルを実装、Edge AIデバイスへデプロイ"
         ),
     )
+
+    st.divider()
+    st.markdown("**GitHub（任意）— 公開リポジトリを自動解析してスコア精度を上げます**")
+    col_gh, col_gh_btn = st.columns([4, 1])
+    with col_gh:
+        github_url_input = st.text_input(
+            "GitHub URL",
+            value=st.session_state.get("w1_github_url", ""),
+            placeholder="例: https://github.com/your-username",
+            label_visibility="collapsed",
+        )
+    with col_gh_btn:
+        analyze_btn = st.button("🔍 解析", key="gh_analyze_btn")
+
+    if analyze_btn and github_url_input.strip():
+        with st.spinner("GitHub APIで解析中..."):
+            gh_result = analyze_github(github_url_input.strip())
+        if gh_result.get("error"):
+            st.error(gh_result["error"])
+        else:
+            st.session_state["w1_github_result"] = gh_result
+            st.session_state["w1_github_url"] = github_url_input.strip()
+            st.success(
+                f"解析完了: @{gh_result['username']} — "
+                f"リポジトリ {gh_result['repo_count']}件 / "
+                f"言語: {', '.join(gh_result['tech_stack']) or '不明'} / "
+                f"スター合計: {gh_result['total_stars']} / "
+                f"直近90日push: {gh_result['commit_frequency']}回"
+            )
+
+    if "w1_github_result" in st.session_state:
+        gr = st.session_state["w1_github_result"]
+        st.caption(
+            f"複雑さスコア: {gr['project_complexity_score']:.2f} / "
+            f"OSSコントリビュート: {'あり' if gr['oss_contribution'] else 'なし'}"
+        )
 
     if st.button("次へ →", type="primary"):
         st.session_state["w1_graduation_year"] = graduation_year
@@ -267,6 +304,8 @@ elif step == 4:
     eval_pref = st.session_state.get("w3_eval_pref")
     psych_safety = st.session_state.get("w3_psych_safety", 0.5)
     mbti_val = st.session_state.get("w3_mbti")
+    gh_result = st.session_state.get("w1_github_result")
+    github_summary = gh_result.get("summary") if gh_result else None
 
     with st.expander("入力内容を確認", expanded=True):
         col1, col2 = st.columns(2)
@@ -286,8 +325,19 @@ elif step == 4:
             st.markdown(f"**評価制度**: {eval_pref or 'こだわらない'}")
             st.markdown(f"**心理的安全性重視度**: {psych_safety:.1f}")
             st.markdown(f"**MBTI**: {mbti_val or '未入力'}")
+        if gh_result:
+            st.markdown(
+                f"**GitHub**: @{gh_result['username']} "
+                f"（リポジトリ{gh_result['repo_count']}件 / "
+                f"複雑さ{gh_result['project_complexity_score']:.2f}）"
+            )
 
-    st.info("「保存して分析」を押すと Sonnet 4.6 で実務力スコアを算出します（数秒かかります）。")
+    if github_summary:
+        st.info("GitHubの活動データも Sonnet 4.6 の評価に反映されます。")
+    else:
+        st.info(
+            "「保存して分析」を押すと Sonnet 4.6 で実務力スコアを算出します（数秒かかります）。"
+        )
 
     col_back, col_save = st.columns(2)
     with col_back:
@@ -314,6 +364,7 @@ elif step == 4:
                     mbti=mbti_val,
                     eval_preference=eval_pref,
                     psych_safety_importance=psych_safety,
+                    github_summary=github_summary,
                     recompute_level=True,
                 )
             st.session_state["db_profile"] = saved
@@ -326,5 +377,7 @@ elif step == 4:
                 f"保存完了！ 実務力スコア: **{saved.tech_level_score:.2f}** / 1.0\n\n"
                 f"> {saved.tech_level_rationale}"
             )
+            if github_summary:
+                st.caption(f"GitHub @{gh_result['username']} のデータも評価に反映されました。")
             st.caption("トップページに戻ってV2マッチングタブを確認してください。")
             st.session_state["wizard_step"] = 1
