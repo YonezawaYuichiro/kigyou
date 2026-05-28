@@ -640,9 +640,38 @@ def extract_all_companies(limit: int | None = None) -> None:
     print(f"[Phase 3c] {completed}社完了、{failed}社失敗")
 
 
+def extract_single_company(name_contains: str) -> bool:
+    """1社を名前（部分一致）で指定して抽出する。信頼度に関わらず再実行する。
+
+    Returns:
+        True if company was found and processed, False otherwise
+    """
+    with get_session() as session:
+        rows = session.execute(
+            sa.select(Company.id, Company.name, Company.official_url).where(
+                Company.name.contains(name_contains)
+            )
+        ).all()
+
+    if not rows:
+        logger.error("企業が見つかりません: '%s'", name_contains)
+        return False
+    if len(rows) > 1:
+        names = [r.name for r in rows]
+        logger.warning("複数候補 %s → 最初の1社を使用: %s", names, rows[0].name)
+
+    cid, name, url = str(rows[0].id), rows[0].name, rows[0].official_url
+    logger.info("単社抽出開始: %s", name)
+    _process_single_company(cid, name, url)
+    return True
+
+
 if __name__ == "__main__":
     import sys
 
     logging.basicConfig(level=settings.log_level)
-    limit_arg = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    extract_all_companies(limit=limit_arg)
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--name="):
+        extract_single_company(sys.argv[1].split("=", 1)[1])
+    else:
+        limit_arg = int(sys.argv[1]) if len(sys.argv) > 1 else None
+        extract_all_companies(limit=limit_arg)
