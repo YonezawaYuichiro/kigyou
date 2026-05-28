@@ -368,7 +368,14 @@ def _upsert_hiring_difficulty(company_id: uuid.UUID, difficulty: float) -> None:
 
 
 def build_all_vectors() -> None:
-    """全企業の CompanyVector と hiring_difficulty_score を算術計算してupsertする。"""
+    """全企業の CompanyVector と hiring_difficulty_score を算術計算してupsertする。
+
+    セッション内でスコアを計算してPythonネイティブ値に変換し、
+    セッション外でupsertする（DetachedInstanceError回避）。
+    """
+    # (company_id, scores, hiring_difficulty) のリスト
+    computed: list[tuple[uuid.UUID, list[float], float | None]] = []
+
     with get_session() as session:
         companies: list[Company] = (
             session.execute(
@@ -380,22 +387,23 @@ def build_all_vectors() -> None:
             .scalars()
             .all()
         )
+        logger.info("ベクトル計算開始: %d社", len(companies))
+        for company in companies:
+            dims = company.dimensions
+            metrics = company.metrics
+            scores = build_vector(company, dims, metrics)
+            difficulty = compute_hiring_difficulty(dims, metrics) if dims else None
+            computed.append((company.id, scores, difficulty))
+            logger.debug("%s → %s", company.name, scores)
 
-    logger.info("ベクトル計算開始: %d社", len(companies))
-    for i, company in enumerate(companies, 1):
-        dims = company.dimensions
-        metrics = company.metrics
-        scores = build_vector(company, dims, metrics)
-        _upsert_vector(company.id, scores)
+    # セッション外でupsert（各関数が独立したセッションを開く）
+    for cid, scores, difficulty in computed:
+        _upsert_vector(cid, scores)
+        if difficulty is not None:
+            _upsert_hiring_difficulty(cid, difficulty)
 
-        if dims:
-            difficulty = compute_hiring_difficulty(dims, metrics)
-            _upsert_hiring_difficulty(company.id, difficulty)
-
-        logger.debug("[%d] %s → %s", i, company.name, scores)
-
-    logger.info("ベクトル計算完了: %d社", len(companies))
-    print(f"[Phase 3d] {len(companies)}社のベクトル計算完了（モデルバージョン: {_MODEL_VERSION}）")
+    logger.info("ベクトル計算完了: %d社", len(computed))
+    print(f"[Phase 3d] {len(computed)}社のベクトル計算完了（モデルバージョン: {_MODEL_VERSION}）")
 
 
 if __name__ == "__main__":

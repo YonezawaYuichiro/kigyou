@@ -56,29 +56,28 @@ def get_priority_ranking(top_n: int = 80) -> list[dict]:
     Returns:
         List of dicts with keys: rank, name, prefecture, category, confidence, priority_score
     """
+    results = []
     with get_session() as session:
         companies: list[Company] = (
             session.execute(sa.select(Company).options(selectinload(Company.dimensions)))
             .scalars()
             .all()
         )
-
-    results = []
-    for company in companies:
-        dims = company.dimensions
-        score = score_for_deep_analysis(company, dims)
-        if score == 0.0:
-            continue
-        results.append(
-            {
-                "name": company.name,
-                "hq_prefecture": company.hq_prefecture,
-                "estimated_category": company.estimated_category,
-                "overall_confidence": dims.overall_confidence if dims else None,
-                "priority_score": score,
-                "official_url": company.official_url,
-            }
-        )
+        for company in companies:
+            dims = company.dimensions
+            score = score_for_deep_analysis(company, dims)
+            if score == 0.0:
+                continue
+            results.append(
+                {
+                    "name": company.name,
+                    "hq_prefecture": company.hq_prefecture,
+                    "estimated_category": company.estimated_category,
+                    "overall_confidence": dims.overall_confidence if dims else None,
+                    "priority_score": score,
+                    "official_url": company.official_url,
+                }
+            )
 
     results.sort(key=lambda x: x["priority_score"], reverse=True)
     results = results[:top_n]
