@@ -122,6 +122,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 }}""",
     "vision_strategy": """\
 {company_name}のビジョン・経営戦略に関する情報を抽出し、JSONのみ出力してください（コードブロック不要）。
+重要: 証拠テキストに明示された記述がない項目は null を出力してください。推測・補完・デフォルト値での補填は禁止です。
 
 テキスト:
 {text}
@@ -129,7 +130,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 出力スキーマ:
 {{
   "star": {{
-    "new_biz_policy_score": <0.0-1.0 新規事業への積極度。言及なし=0.5>,
+    "new_biz_policy_score": <0.0-1.0 新規事業への積極度。公式言及・実績がある場合のみ数値出力。言及なし=null>,
     "new_biz_policy_evidence": "<根拠テキスト60字以内。なければ空文字>"
   }},
   "circle": {{
@@ -205,6 +206,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 }}""",
     "culture_org": """\
 {company_name}の組織カルチャー・心理的安全性に関する情報を抽出し、JSONのみ出力してください。
+重要: 証拠テキストに明示された記述がない項目は null を出力してください。推測・補完・デフォルト値での補填は禁止です。
 
 テキスト:
 {text}
@@ -212,8 +214,8 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 出力スキーマ:
 {{
   "star": {{
-    "psychological_safety_score": <0.0-5.0 心理的安全性。不明=2.5>,
-    "psychological_safety_evidence": "<根拠テキスト60字以内>"
+    "psychological_safety_score": <0.0-5.0 心理的安全性。口コミ・社員ブログ等の具体的証拠がある場合のみ数値出力。証拠なし=null>,
+    "psychological_safety_evidence": "<根拠テキスト60字以内。証拠なし=空文字>"
   }},
   "circle": {{
     "org_structure_type": "<開発部門独立/事業部付き/マトリクス/不明>",
@@ -228,6 +230,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 }}""",
     "career_hr": """\
 {company_name}の人事制度・キャリアパスに関する情報を抽出し、JSONのみ出力してください。
+重要: 証拠テキストに明示された記述がない項目は null を出力してください。推測・補完・デフォルト値での補填は禁止です。
 
 テキスト:
 {text}
@@ -235,13 +238,13 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 出力スキーマ:
 {{
   "star": {{
-    "evaluation_score": <0.0-1.0 評価制度の透明度・公平性>,
+    "evaluation_score": <0.0-1.0 評価制度の透明度・公平性。証拠なし=null>,
     "evaluation_system_type": "<成果主義|年功序列|混在|不明>",
     "career_track_diversity": <true/false/null 専門職ルートあり>,
-    "skill_support_score": <0.0-1.0 スキルアップ支援の充実度>,
+    "skill_support_score": <0.0-1.0 スキルアップ支援の充実度。証拠なし=null>,
     "skill_support_items": ["資格取得補助","書籍購入費","研修制度","カンファレンス参加費" 等],
-    "junior_authority_score": <0.0-5.0 若手への裁量度。不明=2.5>,
-    "junior_authority_evidence": "<根拠テキスト60字以内>"
+    "junior_authority_score": <0.0-5.0 若手への裁量度。具体的な実例・口コミ証拠がある場合のみ数値出力。証拠なし=null>,
+    "junior_authority_evidence": "<根拠テキスト60字以内。証拠なし=空文字>"
   }},
   "circle": {{
     "eval_feedback_freq": "<月次/四半期/半期/年次/不明>",
@@ -298,6 +301,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 }}""",
     "tech_env": """\
 {company_name}の開発環境・技術力に関する情報を抽出し、JSONのみ出力してください。
+重要: 証拠テキストに明示された記述がない項目は null を出力してください。推測・補完・デフォルト値での補填は禁止です。
 
 テキスト:
 {text}
@@ -305,13 +309,13 @@ _CATEGORY_PROMPTS: dict[str, str] = {
 出力スキーマ:
 {{
   "star": {{
-    "tech_modernity_score": <0.0-5.0 技術スタックのモダン度>,
-    "infra_cloud_score": <0.0-5.0 クラウド・コンテナ活用度>,
-    "cicd_maturity_score": <0.0-5.0 CI/CD整備度>,
+    "tech_modernity_score": <0.0-5.0 技術スタックのモダン度。採用技術の具体的記述がある場合のみ出力。証拠なし=null>,
+    "infra_cloud_score": <0.0-5.0 クラウド・コンテナ活用度。具体的な利用サービス記述がある場合のみ出力。証拠なし=null>,
+    "cicd_maturity_score": <0.0-5.0 CI/CD整備度。CI/CDツール・自動化の記述がある場合のみ出力。証拠なし=null>,
     "hw_sw_integration": <true/false/null エッジAI・IoT等のハード連携>,
-    "data_platform_score": <0.0-5.0 データ基盤の充実度>,
-    "tech_debt_culture_score": <0.0-5.0 技術的負債への向き合い度>,
-    "tech_env_evidence": "<開発環境全般の根拠テキスト100字以内>"
+    "data_platform_score": <0.0-5.0 データ基盤の充実度。DWH・データパイプラインの記述がある場合のみ出力。証拠なし=null>,
+    "tech_debt_culture_score": <0.0-5.0 技術的負債への向き合い度。具体的な取り組み記述がある場合のみ出力。証拠なし=null>,
+    "tech_env_evidence": "<開発環境全般の根拠テキスト100字以内。証拠なし=空文字>"
   }},
   "circle": {{
     "agile_maturity": "<スクラム定着/試験的導入/ウォーターフォール/不明>",
@@ -592,6 +596,18 @@ def _process_single_company(company_id: str, name: str, url: str | None) -> None
     _upsert_dimensions(company_id, all_star, [url or ""], overall_conf)
     _upsert_circle_fields(company_id, all_circle)
     logger.info("  ✓ %s overall_confidence=%.2f ○件数=%d件", name, overall_conf, len(all_circle))
+
+    # V5 company_feature への追加書き込み（V2 書き込みの後）
+    try:
+        from backend.seed.feature_writer_v5 import write_from_circle, write_from_star
+        from backend.seed.normalizer import normalize_all
+
+        star_n = write_from_star(company_id, all_star, overall_conf)
+        circle_n = write_from_circle(company_id, all_circle, overall_conf)
+        normalize_all(uuid.UUID(company_id))
+        logger.info("  [V5] star=%d件 circle=%d件 → 正規化完了", star_n, circle_n)
+    except Exception as e:
+        logger.warning("  [V5] feature_writer_v5 失敗（V2書き込みは完了済み）: %s", e)
 
 
 def extract_all_companies(limit: int | None = None) -> None:

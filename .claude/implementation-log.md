@@ -2,6 +2,235 @@
 
 ---
 
+## 2026-06-04: Phase 5a 本検証 — パイプライン実行・配管テスト・バグ修正
+
+- **実装内容**:
+  - `backend/seed/master_data.py` — `github_activity_score` を feature_definition に追加（59件）
+  - `backend/seed/dimensions_extractor.py` — Haiku プロンプト4箇所を修正
+    - `不明=2.5` / `言及なし=0.5` → `証拠なし=null。証拠なき場合はフィールドを省略`
+    - 対象: `culture_org.psychological_safety_score`, `career_hr.junior_authority_score`,
+      `vision_strategy.new_biz_policy_score`, `tech_env` 全5スコア項目
+  - `tests/seed/test_feature_writer_v5.py` — **新規**: `_convert()` 単体テスト 23件
+  - `backend/seed/validate_pipeline_v5.py` — **新規**: V2 dims → write_from_star 配管テストスクリプト
+  - `backend/seed/feature_writer_v5.py` — `_upsert_feature` の戻り値を bool に変更（カウントバグ修正）
+
+- **実際に走らせて発見したバグ（走らせなければ永久に気づかなかった）**:
+  1. `github_activity_score` が feature_definition に未登録 → FK 違反で write_github_stats が失敗
+  2. `write_from_star` の written カウントが保護スキップを含めてカウントしていた（`_upsert_feature` が None 返し）
+
+- **V2 Haiku 抽出 vs V5 手入力 差分（サイボウズ）**:
+  - psychological_safety: V2=2.5（デフォルト） vs V5=5.0（手入力） → 差 -2.5
+  - young_autonomy: V2=2.5 vs V5=4.0 → 差 -1.5
+  - competitive_advantage: V2=4.0 vs V5=4.0 → 一致
+  - evaluation_score=0.0 も「証拠なし」デフォルト → pct_to_scale5 で 1.0（最低）に変換 → 誤値
+
+- **設計上の結論**:
+  - Haiku は主観項目（psychological_safety, young_autonomy）を証拠なしで中間値（2.5）で埋める
+  - プロンプト修正（証拠なし→null）で次回以降は改善される
+  - 客観項目（salary, listing, rnd, github）はパイプラインで素直に入る
+  - 主観項目は自動化の限界: 手検証 or confidence ゲートで低品質時は非表示が正しい設計
+
+- **動作確認**: `pytest tests/ -q` → 44/44 passed。`ruff check` → All checks passed
+  - validate_pipeline_v5 実行結果: Cybozu → star 1/8 件書き込み（7件 official/review 保護、配管確認OK）
+
+## 2026-06-04: Phase 5b — 2社目（freee/PFN）投入・ランキング検証・sanity check
+
+- **実装内容**:
+  - `backend/seed/phase1_freee.py` — **新規**: freee株式会社データ投入（53件・正規化済）
+  - `backend/seed/phase1_pfn.py` — **新規**: Preferred Networks株式会社データ投入（新規INSERT・51件）
+    - company INSERT 時に hq_prefecture / estimated_category / tech_stack / hiring_roles / llm_confidence / release_flag が NOT NULL 制約で必要だった
+
+- **ランキング結果（sanity check）**:
+  - 事前宣言: PFN > サイボウズ > freee（MLOps/R&D重視ペルソナのため）
+  - 実結果: freee(84.8) > サイボウズ(84.0) > PFN(77.7)
+  - **差分の原因**: phase3_user_prefs.py が f:mlops_maturity 等に desired_value=4 を設定
+    → 距離ペナルティにより PFN(5/5) が subscore=0.75、freee(4/5) が 1.00 になる
+    → 意図は「4以上が良い」→ desired_min=4 を使うべきだった（desired_value は「ちょうど4が好み」）
+
+- **非SaaSスキーマ検証（Phase 5b の主目的）**:
+  - patent_count（直接値）: PFN 200件 → normalized=0.40 ✓
+  - f:hw_sw_integration（scale5）: PFN 5/5 → normalized=1.00 ✓
+  - tech_tag hardware カテゴリ: NVIDIA GPU / エッジAI / ロボティクス 投入 ✓
+  - スキーマ変更なしで非SaaSドメイン対応完了 ✓
+
+- **残課題**: phase3_user_prefs.py の f:mlops_maturity / f:data_platform_maturity を
+  desired_value=4 → desired_min=4 に変更すると PFN が期待通り上位になる（Phase 5c で修正可）
+
+## 2026-06-04: Phase 5a — 自動パイプライン → company_feature (V5) 対応
+
+- **実装内容**:
+  - `backend/seed/feature_writer_v5.py` — **新規**: Haiku 抽出結果を V5 company_feature に書き込むユーティリティ
+    - `write_from_star()`: Haiku star dict → 16 feature_key へ upsert
+    - `write_from_circle()`: Haiku circle dict → 8 feature_key へ upsert（overtime_hours など2スロット対応）
+    - `write_github_stats()`: GitHub スコア (0-1) → github_activity_score (0-100)
+    - `write_blog_stats()`: ブログ更新頻度 → oss_blog_freq
+  - `backend/seed/dimensions_extractor.py` — `_process_single_company()` 末尾に V5 書き込み + 正規化を追加
+  - `backend/seed/deep_dive.py` — Step 2 (GitHub) / Step 3 (Blog) 後に V5 書き込み追加、Step 5 前に normalize_all 追加
+
+- **設計判断**:
+  - V2 テーブル（CompanyDimensions）への書き込みはそのまま維持（並列書き込み）
+  - 手入力データ（source_type='official'/'review'）は自動抽出で上書きしない（保護）
+  - Haiku の出力スケール差を吸収: scale5_direct(0-5) / pct_to_scale5(0-1→1-5) / pct_to_pct100(0-1→%)
+  - `cicd_maturity_score` → `f:mlops_maturity` は最近接マッピング（V5 master に f:cicd_maturity なし）
+  - `has_patent`（bool）→ スキップ（V5 は patent_count/direct を使う。Haiku から count が取れない）
+  - `hw_sw_integration`（bool）→ `f:hw_sw_integration`（scale5）: True→5.0 / False→1.0
+
+- **動作確認**: `pytest tests/ -v` → 21/21 passed。`ruff check` → All checks passed
+
+## 2026-06-04: Phase 5 前提 — normalizer direction 不変条件テスト
+
+- **実装内容**:
+  - `tests/seed/test_normalizer.py` — **新規**: `_normalize()` の direction 反転を 12ケースで検証
+    - high_good: 高値 → 高スコア
+    - low_good: 低値 → 高スコア（反転）。サイボウズ残業 12h → 0.85 も検証
+    - クランプ（範囲外値）、neutral、min=max のエッジケース
+
+- **設計判断**:
+  - `value_normalized` は常に「1.0 = 最も望ましい」の不変条件を normalizer.py L83-84 が保証
+  - この前提がないと "_compute_subscore で desired_min/max → value_normalized をそのまま" という設計が符号逆転を引き起こす
+  - 84.0点の WLB・安定性寄与が正符号で計算されていることを単体テストで確認
+
+- **動作確認**: `pytest tests/seed/test_normalizer.py -v` → 12/12 passed。`ruff check` もクリア
+
+---
+
+## 2026-06-04: V5 gap 対応 — field_mapping.md / 1.基本情報.txt / schema.sql の未実装項目埋め
+
+- **実装内容**:
+  - `backend/models.py` — Company に `listing_type` / `founded_year` / `target_market` 追加
+  - `alembic/versions/d2e3f4a5b6c7_v5_company_extra_columns.py` — **新規** migration
+    - 既存 head `725ed1d875c4`（fix_constraints）の後続に接続（down_revision 修正で解決）
+  - `backend/seed/master_data.py` — feature_definition を 50件 → **58件** に拡充
+    - `patent_count` / `business_domain` / `target_market` / `organization_type`
+    - `has_fixed_ot` / `fixed_ot_hours` / `placement_guaranteed` / `f:global_expansion`
+  - `backend/seed/phase1_cybozu.py` — サイボウズデータを 49件 → **55件** に拡充
+    - company.listing_type="東証プライム" / founded_year=1997 / target_market="BtoB"
+    - 新feature: organization_type=4 / has_fixed_ot=1 / fixed_ot_hours=30 / f:global_expansion=3 等
+
+- **設計判断**:
+  - `listing_type` は TEXT（ENUM にしない）— 東証プライム/スタンダード/グロース/未上場/グループ等多様なため
+  - `target_market` は company 直接列（簡易版）。将来的にタグ化（business_domain タグと同様）
+  - `business_domain` / `target_market` / `charging_model` は tag型 → company_feature で数値保存しない。completeness = 55/58 (95%) は正常
+  - alembic "Multiple head revisions" は `725ed1d875c4` という既存 fix migration が存在したため。down_revision を修正して解決
+
+- **動作確認**:
+  - feature_definition: 58件・scale5全件rubric付き
+  - company_completeness: 55/58 (95%)
+  - マッチングスコア: 84.0点 維持（新項目はuser_preferenceに未登録のため加重平均に未反映）
+
+---
+
+## 2026-06-03: V5 Phase 4 — マッチングスコア計算エンジン
+
+- **実装内容**:
+  - `backend/api/matching_engine_v5.py` — **新規**: feature_key EAV ベース加重平均マッチングエンジン
+    - V2 pgvector エンジン (matching_engine.py) と並存。既存コードを破壊しない
+    - ハードフィルタ: raw値で判定（overtime_hours ≤ 30 / remote_rate ≥ 50%）
+    - サブスコア: desired_value あり → 距離ペナルティ / なし → value_normalized をそのまま使用
+    - bool: 一致=1.0 / 不一致=0.0
+    - 加重平均: weight = user_preference.weight ?? feature_definition.default_weight
+    - 欠損データは分子・分母ともに除外（0扱いしない）
+    - 寄与TOP3 / BOTTOM3 で説明可能性を確保
+    - CLI: `python -m backend.api.matching_engine_v5 --user-id UUID --company-id UUID`
+
+- **設計判断**:
+  - tag/onehot はマッチング時の Jaccard 計算に回す（Phase 5）
+  - desired_min/max soft preference は value_normalized をそのまま使用（direction 考慮済みのため）
+  - Windows cp932 対応で出力に ASCII 文字のみ使用（≥→>= / ≤→<= / ✓→[OK]）
+
+- **動作確認**:
+  - サイボウズ × ユーザー: **総合スコア 84.0点**
+  - ハードフィルタ: [OK] 通過（残業12h≤30 / リモート85%≥50%）
+  - TOP3: f:data_platform_maturity / f:mlops_maturity / f:tech_debt_culture（全て1.00×w=1.5）
+  - BOTTOM3: has_housing_support=0.00 / oss_blog_freq=0.16 / diversity=0.75（低weightで影響小）
+
+- **残課題（Phase 5）**:
+  - tag/onehot の Jaccard マッチング実装
+  - 2社目以降を追加してランキングを検証
+  - industry_master / tech_tag マスタを拡充
+
+---
+
+## 2026-06-03: V5 Phase 3 — ユーザー希望条件 (user_preference) 投入
+
+- **実装内容**:
+  - `backend/seed/phase3_user_prefs.py` — **新規**: my_profile.json → user_preference 変換
+    - UserProfile を session_id="phase3_yuichiro" で生成（tech_skills / target_roles / qualifications 保存）
+    - user_preference: 39件投入（ハードフィルタ2件: overtime_hours≤30 / remote_rate≥50%）
+    - weight を old_weight（tech_growth/wlb/self_developed）から feature_key 粒度にマッピング
+    - 高優先: f:mlops_maturity / f:data_platform_maturity / f:tech_debt_culture → w=1.5
+    - 中優先: f:young_autonomy / f:skill_support_quality / rnd_ratio → w=1.2〜1.3
+    - 低優先: has_housing_support / diversity → w=0.2
+
+- **設計判断**:
+  - weight=None の項目は feature_definition.default_weight を自動継承（設定不要項目は省略）
+  - desired_min/max で範囲指定（例: turnover_3yr ≤ 20%、salary_age30 ≥ 500万）
+  - tech_stack 希望（Python/PyTorch/AWS）はUserProfile.tech_skillsに保存。Jaccard類似度はPhase 4マッチングエンジンで処理
+
+- **動作確認**: ruff OK / 39件投入・0件スキップ
+
+---
+
+## 2026-06-03: V5 Phase 2 — 特徴量正規化パイプライン
+
+- **実装内容**:
+  - `backend/seed/normalizer.py` — **新規**: value_normalized 計算バッチ
+    - `direct` / `scale5` / `bool` 対象。`tag` / `onehot` はマッチング時に Jaccard 等で処理
+    - `high_good` / `neutral`: `(v - min) / (max - min)`、クランプ [0, 1]
+    - `low_good`: `1 - (v - min) / (max - min)`（残業・離職率・exec_field_distance 等）
+    - `has_official_actual=True`: `value_actual` 優先、なければ `value_official`
+    - `--company-id UUID` オプションで1社指定可能
+
+- **設計判断**:
+  - v1は feature_definition.value_min/max による固定正規化。業界内相対正規化はPhase 5以降
+  - 再実行時は既存 value_normalized を上書きするため、データ更新後にそのまま再実行可能
+
+- **動作確認**:
+  - サイボウズ 49件更新・0件スキップ
+  - 心理的安全性・ボトムアップ = 1.00 / リモート実態85% = 0.85 / 残業12h(low_good) = 0.85 など直感的な結果を確認
+
+- **残課題**:
+  - Phase 3: UserPreference 入力（希望値 + weight + hard_filter）
+  - Phase 4: マッチングスコア計算
+
+---
+
+## 2026-06-03: V5 Phase 0 — 3層DB構成スキーマ確定 & 特徴量カタログ整備
+
+- **実装内容**:
+  - `backend/models.py` — 新テーブル12本追加 + Company に2カラム追加
+    - 原本層: `JobRole` / `Office` / `IndustryMaster` / `CompanyIndustry` / `TechTag` / `CompanyTech` / `SalaryRecord` / `RevenueRecord` / `CompanyText`
+    - 特徴量層: `FeatureDefinition` / `CompanyFeature`（縦持ちEAV）
+    - ユーザー層: `UserPreference`
+    - `Company` に `has_relocation`（転勤有無）/ `engineer_count` を追加
+  - `alembic/versions/c1d2e3f4a5b6_v5_two_layer.py` — マイグレーション
+    - `NULLS NOT DISTINCT` index（PG16）でrole_id=NULL全社行の重複防止
+    - `BigInteger` で revenue/operating_profit（Integer上限~21.4億円超え対策）
+    - `CheckConstraint` で source_type/method/direction のタイポをDB側で防止
+    - `CREATE VIEW company_completeness`（NULL非0扱いのペナルティ可視化）
+  - `backend/seed/master_data.py` — **新規**: マスタデータ投入スクリプト
+    - industry_master: 20業界カテゴリ
+    - tech_tag: 85タグ（language/framework/cloud/mlops/data/devops/hardware）
+    - feature_definition: 50項目（★=1.0/〇=0.5/再考✕=0.2、scale5全件にrubric付与）
+
+- **設計判断**:
+  - CompanyDimensions/CompanyMetrics は漸進廃止方針（既存コード稼働中のため即時DROP不可）
+  - feature_definitionの feature_key は `f:` prefix を scale5 の識別に使用（field_mapping.md の正本に従う）
+  - `NULLS NOT DISTINCT` は PG15+ 機能。プロジェクトの Docker イメージ `pgvector/pgvector:pg16` で使用可能
+  - value_normalized の正規化基準は v1 固定 min/max。相対正規化（業界内）は Phase 5 以降
+
+- **動作確認**:
+  - `ruff check` ALL PASS（3ファイル）
+  - `pytest` 26 passed（既存テスト全通過）
+  - `alembic upgrade head` — Docker 未起動のため未実行。Docker Desktop 起動後に実行すること
+
+- **残課題**:
+  - Docker Desktop 起動 → `alembic upgrade head` → `python -m backend.seed.master_data`
+  - Phase 1: 実在1社を原本層に手動入力し `SELECT * FROM company_completeness` で網羅率確認
+  - feature_definition の追加・補正はPhase 1埋め後に判明する（過不足は実際に埋めて初めて分かる）
+
+---
+
 ## 2026-05-28: V4 企業分析精度評価システム
 
 - **実装内容**:

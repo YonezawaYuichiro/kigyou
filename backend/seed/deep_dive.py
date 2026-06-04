@@ -112,6 +112,14 @@ def run_deep_dive(name_contains: str, skip_gemini: bool = False) -> None:
         ev = gh_stats.to_evidence_text()
         if ev:
             print(f"  証拠 : {ev}")
+        # V5: github_activity_score を company_feature に書き込む
+        try:
+            from backend.seed.feature_writer_v5 import write_github_stats
+
+            write_github_stats(company_id, gh_stats.compute_github_score())
+            print("  [V5] github_activity_score 更新")
+        except Exception as e:
+            print(f"  [V5] GitHub書き込み失敗: {e}")
     time.sleep(0.5)
 
     # ── Step 3: ブログ解析 ────────────────────────────────────────────────
@@ -129,6 +137,14 @@ def run_deep_dive(name_contains: str, skip_gemini: bool = False) -> None:
         print(f"  著者数   : {blog_stats.unique_authors}名")
         print(f"  技術タグ : {', '.join(blog_stats.tech_tags[:6])}")
         print(f"  スコア   : {blog_stats.compute_blog_score():.3f}")
+        # V5: oss_blog_freq を company_feature に書き込む
+        try:
+            from backend.seed.feature_writer_v5 import write_blog_stats
+
+            write_blog_stats(company_id, blog_stats.post_frequency_per_month)
+            print("  [V5] oss_blog_freq 更新")
+        except Exception as e:
+            print(f"  [V5] ブログ書き込み失敗: {e}")
     time.sleep(0.5)
 
     # ── Step 4: Dimensions抽出（Gemini必要） ──────────────────────────────
@@ -147,6 +163,17 @@ def run_deep_dive(name_contains: str, skip_gemini: bool = False) -> None:
             print(f"  ❌ 抽出失敗: {e}")
 
     # ── Step 5: ベクトル再計算（無料） ───────────────────────────────────
+    # V5: value_normalized を最新状態に更新してからベクトルを再計算する
+    try:
+        import uuid as _uuid
+
+        from backend.seed.normalizer import normalize_all
+
+        normalize_all(_uuid.UUID(company_id))
+        print("\n[V5] value_normalized 更新完了")
+    except Exception as e:
+        print(f"\n[V5] 正規化失敗: {e}")
+
     print("\n🔢 Step 5: 10次元ベクトル再計算")
     try:
         from sqlalchemy.orm import selectinload

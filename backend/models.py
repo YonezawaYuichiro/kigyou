@@ -1,16 +1,20 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSON, UUID
@@ -42,6 +46,13 @@ class Company(Base):
     hiring_roles: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     llm_confidence: Mapped[str] = mapped_column(String(10), nullable=False)
     release_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_relocation: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    engineer_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    listing_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # 上場/未上場/グループ/東証プライム/東証スタンダード/東証グロース
+    founded_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_market: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # BtoB / BtoC / BtoBtoC / 製造 / Web 等（簡易1列版。Phase 5でタグ化予定）
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -305,3 +316,241 @@ class MatchResult(Base):
 
     user_profile: Mapped["UserProfile"] = relationship(back_populates="match_results")
     company: Mapped["Company"] = relationship(back_populates="match_results")
+
+
+# ============================================================
+# V5 新規テーブル: 3層DB構成（原本層 / 特徴量層 / ユーザー層）
+# ============================================================
+
+# --- 原本層 (Source of Truth) ---
+
+
+class JobRole(Base):
+    """company × role 粒度の受け皿。v1はrole_id=NULL（全社）中心。"""
+
+    __tablename__ = "job_role"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    role_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # backend / frontend / ml / infra / embedded / data / qa
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+
+class Office(Base):
+    __tablename__ = "office"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    location: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_dev_site: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class IndustryMaster(Base):
+    __tablename__ = "industry_master"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+
+
+class CompanyIndustry(Base):
+    __tablename__ = "company_industry"
+    __table_args__ = (PrimaryKeyConstraint("company_id", "industry_id"),)
+
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    industry_id: Mapped[int] = mapped_column(ForeignKey("industry_master.id"))
+
+
+class TechTag(Base):
+    __tablename__ = "tech_tag"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(30), nullable=False)
+    # language / framework / cloud / mlops / data / devops / hardware / database
+
+
+class CompanyTech(Base):
+    __tablename__ = "company_tech"
+    __table_args__ = (
+        # PG16: NULLS NOT DISTINCT で role_id=NULL（全社）行の重複を防ぐ
+        UniqueConstraint(
+            "company_id",
+            "tech_tag_id",
+            "role_id",
+            postgresql_nulls_not_distinct=True,
+            name="uq_company_tech",
+        ),
+        CheckConstraint(
+            "source_type IN ('official','review','estimated')",
+            name="ck_company_tech_source_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    tech_tag_id: Mapped[int] = mapped_column(ForeignKey("tech_tag.id"))
+    role_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("job_role.id"), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+class SalaryRecord(Base):
+    __tablename__ = "salary_record"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    # 初任給_学部 / 初任給_院 / 30歳平均 / 3年後 / 5年後 / 賞与込想定_30歳
+    amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    includes_bonus: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RevenueRecord(Base):
+    __tablename__ = "revenue_record"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    # BigInteger必須: Integer上限は約21.4億円。中堅企業でもオーバーフローする
+    revenue: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    operating_profit: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    is_profitable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+
+class CompanyText(Base):
+    """理念原文・弱み・求める人物像・口コミをkindで分類して一テーブルに統合。"""
+
+    __tablename__ = "company_text"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    # "values" / "weakness" / "persona" / "review"
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+# --- 特徴量層 (Feature Store) ---
+
+
+class FeatureDefinition(Base):
+    """全採用項目のマスタ。method / direction のCheckConstraintでDB側バリデーション。"""
+
+    __tablename__ = "feature_definition"
+    __table_args__ = (
+        CheckConstraint(
+            "method IN ('direct','scale5','bool','tag','onehot')",
+            name="ck_feature_def_method",
+        ),
+        CheckConstraint(
+            "direction IN ('high_good','low_good','neutral')",
+            name="ck_feature_def_direction",
+        ),
+    )
+
+    feature_key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    method: Mapped[str] = mapped_column(String(20), nullable=False)
+    # "direct" / "scale5" / "bool" / "tag" / "onehot"
+    unit: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    value_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    value_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction: Mapped[str] = mapped_column(String(15), default="neutral")
+    # "high_good" / "low_good" / "neutral"
+    default_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    # ★=1.0 / 〇=0.5 / 再考✕=0.2
+    has_official_actual: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True=company_featureにvalue_official+value_actualの両列で格納する
+    rubric: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # scale5必須: "5=... | 3=... | 1=..." 形式。空欄は未完扱い
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class CompanyFeature(Base):
+    """縦持ちEAV。UNIQUE(company_id, role_id, feature_key)。role_id=NULLは全社値。"""
+
+    __tablename__ = "company_feature"
+    __table_args__ = (
+        # PG16: NULLS NOT DISTINCT で role_id=NULL（全社）行の重複を防ぐ
+        UniqueConstraint(
+            "company_id",
+            "role_id",
+            "feature_key",
+            postgresql_nulls_not_distinct=True,
+            name="uq_company_feature",
+        ),
+        CheckConstraint(
+            "source_type IN ('official','review','estimated')",
+            name="ck_company_feature_source_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("company.id", ondelete="CASCADE"))
+    role_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("job_role.id"), nullable=True)
+    feature_key: Mapped[str] = mapped_column(
+        ForeignKey("feature_definition.feature_key"), nullable=False
+    )
+
+    # 値スロット（NULL=不明。0=ゼロ値。絶対に混同しない）
+    value_numeric: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 直接値 / scale5の生値
+    # v1はfeature_definition.value_min/maxによる固定正規化のみ。相対正規化はPhase 5以降
+    value_normalized: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 0-1正規化後（マッチング用）
+    value_official: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # has_official_actual=TRUEの項目: 制度・公称値
+    value_actual: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # has_official_actual=TRUEの項目: 実態（口コミ/推定）
+
+    # メタ（全値共通）
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # "official" / "review" / "estimated"
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+# --- ユーザー層 ---
+
+
+class UserPreference(Base):
+    """企業側CompanyFeatureと対称な希望値。weight=NULLならdefault_weightを使用。"""
+
+    __tablename__ = "user_preference"
+    __table_args__ = (UniqueConstraint("user_profile_id", "feature_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("user_profile.id", ondelete="CASCADE")
+    )
+    feature_key: Mapped[str] = mapped_column(
+        ForeignKey("feature_definition.feature_key"), nullable=False
+    )
+    desired_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    desired_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    desired_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # tag系feature用: 希望するtech_tag.idのリスト。FKが効かないのでアプリ側で実在チェック必須
+    desired_tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # NULL → feature_definition.default_weight を使用
+    is_hard_filter: Mapped[bool] = mapped_column(Boolean, default=False)
